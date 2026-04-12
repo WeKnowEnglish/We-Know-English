@@ -1,0 +1,824 @@
+import { addDays, endOfDay, subDays } from "date-fns";
+import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { buildOccurrenceKey, getScheduleEvents, sessionDateFromScheduleInstant } from "@/lib/class-schedule";
+import { normalizeAttendanceStatus } from "@/lib/attendance-utils";
+import {
+  classRowToClassRoom,
+  enrollmentRowToEnrollment,
+  studentRowToStudent,
+} from "@/lib/tracker-mappers";
+import type { AttendanceStatus, ClassRoom, Student, StudentClassEnrollment } from "@/lib/tracker-types";
+
+export async function verifyOrgMembership(userId: string, organizationId: string): Promise<boolean> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return false;
+  const { data } = await supabase
+    .from("organization_members")
+    .select("id")
+    .eq("profile_id", userId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  return Boolean(data);
+}
+
+export async function fetchClassesForOrg(organizationId: string): Promise<ClassRoom[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("classes")
+    .select("id, name, created_at, settings")
+    .eq("organization_id", organizationId)
+    .order("created_at", { ascending: false });
+  if (error || !data) return [];
+  return data.map((row) => classRowToClassRoom(row as Parameters<typeof classRowToClassRoom>[0]));
+}
+
+export async function fetchStudentsForOrg(organizationId: string): Promise<Student[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("students")
+    .select("id, full_name, level, email, birthdate, skills_points, linked_user_id, profile")
+    .eq("organization_id", organizationId)
+    .order("created_at", { ascending: false });
+  if (error || !data) return [];
+  return data.map((row) => studentRowToStudent(row as Parameters<typeof studentRowToStudent>[0]));
+}
+
+export async function fetchEnrollmentsForOrg(organizationId: string): Promise<StudentClassEnrollment[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("enrollments")
+    .select("student_id, class_id, created_at")
+    .eq("organization_id", organizationId);
+  if (error || !data) return [];
+  return data.map((row) => enrollmentRowToEnrollment(row as Parameters<typeof enrollmentRowToEnrollment>[0]));
+}
+
+export async function fetchClassById(organizationId: string, classId: string): Promise<ClassRoom | null> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("classes")
+    .select("id, name, created_at, settings")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return classRowToClassRoom(data as Parameters<typeof classRowToClassRoom>[0]);
+}
+
+export async function fetchStudentById(organizationId: string, studentId: string): Promise<Student | null> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return null;
+  const { data, error } = await supabase
+    .from("students")
+    .select("id, full_name, level, email, birthdate, skills_points, linked_user_id, profile")
+    .eq("organization_id", organizationId)
+    .eq("id", studentId)
+    .maybeSingle();
+  if (error || !data) return null;
+  return studentRowToStudent(data as Parameters<typeof studentRowToStudent>[0]);
+}
+
+/** Classes the signed-in user is enrolled in as a linked student (RLS-scoped). */
+export type StudentEnrollmentClassSummary = {
+  classId: string;
+  className: string;
+  organizationId: string;
+  joinedAt: string;
+};
+
+export async function fetchStudentEnrollmentClasses(): Promise<StudentEnrollmentClassSummary[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  const { data, error } = await supabase
+    .from("enrollments")
+    .select("class_id, organization_id, created_at, classes(name)")
+    .order("created_at", { ascending: false });
+
+  if (error || !data?.length) return [];
+
+  const out: StudentEnrollmentClassSummary[] = [];
+  for (const row of data as {
+    class_id: string;
+    organization_id: string;
+    created_at: string;
+    classes: { name: string } | { name: string }[] | null;
+  }[]) {
+    const cls = row.classes;
+    const name =
+      cls && !Array.isArray(cls)
+        ? cls.name
+        : Array.isArray(cls) && cls[0]
+          ? cls[0].name
+          : "Class";
+    out.push({
+      classId: row.class_id,
+      className: name,
+      organizationId: row.organization_id,
+      joinedAt: row.created_at,
+    });
+  }
+  return out;
+}
+
+export type AttendanceSessionBundle = {
+  sessionId: string;
+  classId: string;
+  sessionDate: string;
+  occurrenceKey: string | null;
+  finalized: boolean;
+  attendance: Record<string, AttendanceStatus>;
+};
+
+export async function fetchAttendanceSessionBundle(
+  organizationId: string,
+  sessionId: string,
+): Promise<AttendanceSessionBundle | null> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return null;
+  const { data: session, error: se } = await supabase
+    .from("sessions")
+    .select("id, class_id, session_date, occurrence_key, attendance_finalized")
+    .eq("organization_id", organizationId)
+    .eq("id", sessionId)
+    .maybeSingle();
+  if (se || !session) return null;
+  const row = session as {
+    id: string;
+    class_id: string;
+    session_date: string;
+    occurrence_key: string | null;
+    attendance_finalized: boolean;
+  };
+  const { data: recs } = await supabase.from("attendance_records").select("student_id, status").eq("session_id", row.id);
+  const attendance: Record<string, AttendanceStatus> = {};
+  for (const r of recs ?? []) {
+    const rec = r as { student_id: string; status: string };
+    attendance[rec.student_id] = normalizeAttendanceStatus(rec.status);
+  }
+  return {
+    sessionId: row.id,
+    classId: row.class_id,
+    sessionDate: String(row.session_date).slice(0, 10),
+    occurrenceKey: row.occurrence_key,
+    finalized: row.attendance_finalized,
+    attendance,
+  };
+}
+
+/** Distinct finalized sessions where at least one attendance row was last saved by this profile. */
+export type FinalizedSessionMarkedByMeRow = {
+  sessionId: string;
+  classId: string;
+  className: string;
+  sessionDate: string;
+  recordsMarked: number;
+};
+
+export async function fetchFinalizedSessionsMarkedByProfile(
+  organizationId: string,
+  profileId: string,
+): Promise<FinalizedSessionMarkedByMeRow[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  type SessionEmbed = {
+    id: string;
+    session_date: string;
+    attendance_finalized: boolean;
+    class_id: string;
+    classes: { name: string } | { name: string }[] | null;
+  };
+  type Rec = { session_id: string; sessions: SessionEmbed | SessionEmbed[] | null };
+
+  const accum: Rec[] = [];
+  const pageSize = 1000;
+  for (let start = 0; ; start += pageSize) {
+    const { data, error } = await supabase
+      .from("attendance_records")
+      .select("session_id, sessions(id, session_date, attendance_finalized, class_id, classes(name))")
+      .eq("organization_id", organizationId)
+      .eq("marked_by", profileId)
+      .order("session_id", { ascending: true })
+      .range(start, start + pageSize - 1);
+    if (error) break;
+    if (!data?.length) break;
+    accum.push(...(data as Rec[]));
+    if (data.length < pageSize) break;
+  }
+
+  type SessionRow = {
+    id: string;
+    session_date: string;
+    attendance_finalized: boolean;
+    class_id: string;
+    classes: { name: string } | { name: string }[] | null;
+  };
+  const finalizedByMeSessions: SessionRow[] = [];
+  for (let start = 0; ; start += pageSize) {
+    const { data, error } = await supabase
+      .from("sessions")
+      .select("id, session_date, attendance_finalized, class_id, classes(name)")
+      .eq("organization_id", organizationId)
+      .eq("attendance_finalized", true)
+      .eq("attendance_finalized_by", profileId)
+      .order("session_date", { ascending: false })
+      .range(start, start + pageSize - 1);
+    if (error) break;
+    if (!data?.length) break;
+    finalizedByMeSessions.push(...(data as SessionRow[]));
+    if (data.length < pageSize) break;
+  }
+
+  const merged = new Map<string, FinalizedSessionMarkedByMeRow>();
+  for (const r of accum) {
+    const sRaw = r.sessions;
+    const s = Array.isArray(sRaw) ? sRaw[0] : sRaw;
+    if (!s || !s.attendance_finalized) continue;
+    const cls = s.classes;
+    const className =
+      cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
+    const sessionDate = String(s.session_date).slice(0, 10);
+    const sid = r.session_id;
+    const prev = merged.get(sid);
+    if (prev) merged.set(sid, { ...prev, recordsMarked: prev.recordsMarked + 1 });
+    else
+      merged.set(sid, {
+        sessionId: sid,
+        classId: s.class_id,
+        className,
+        sessionDate,
+        recordsMarked: 1,
+      });
+  }
+
+  const finalizedIds = finalizedByMeSessions.map((s) => s.id);
+  const myMarkedBySession = new Map<string, number>();
+  const idChunkSize = 200;
+  for (let c = 0; c < finalizedIds.length; c += idChunkSize) {
+    const idChunk = finalizedIds.slice(c, c + idChunkSize);
+    if (idChunk.length === 0) continue;
+    for (let start = 0; ; start += pageSize) {
+      const { data, error } = await supabase
+        .from("attendance_records")
+        .select("session_id")
+        .eq("organization_id", organizationId)
+        .eq("marked_by", profileId)
+        .in("session_id", idChunk)
+        .order("session_id", { ascending: true })
+        .range(start, start + pageSize - 1);
+      if (error) break;
+      if (!data?.length) break;
+      for (const row of data as { session_id: string }[]) {
+        const sid = row.session_id;
+        myMarkedBySession.set(sid, (myMarkedBySession.get(sid) ?? 0) + 1);
+      }
+      if (data.length < pageSize) break;
+    }
+  }
+
+  for (const s of finalizedByMeSessions) {
+    if (!s.attendance_finalized) continue;
+    const cls = s.classes;
+    const className =
+      cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
+    const sessionDate = String(s.session_date).slice(0, 10);
+    const sid = s.id;
+    const prev = merged.get(sid);
+    const markedCount = myMarkedBySession.get(sid) ?? 0;
+    if (prev) {
+      merged.set(sid, {
+        ...prev,
+        recordsMarked: Math.max(prev.recordsMarked, markedCount),
+      });
+      continue;
+    }
+    merged.set(sid, {
+      sessionId: sid,
+      classId: s.class_id,
+      className,
+      sessionDate,
+      recordsMarked: markedCount,
+    });
+  }
+
+  return [...merged.values()].sort(
+    (a, b) => b.sessionDate.localeCompare(a.sessionDate) || a.className.localeCompare(b.className),
+  );
+}
+
+export type AttendanceReportRow = {
+  id: string;
+  studentId: string;
+  studentName: string;
+  classId: string;
+  className: string;
+  sessionDate: string;
+  status: AttendanceStatus;
+  markedAt: string;
+  markedByName: string | null;
+  finalized: boolean;
+};
+
+export async function fetchAttendanceReportForOrg(params: {
+  organizationId: string;
+  dateFrom: string;
+  dateTo: string;
+  classId?: string | null;
+}): Promise<AttendanceReportRow[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  /** PostgREST returns at most ~1000 rows per request; paginate so older sessions (e.g. March) are not silently dropped. */
+  const pageSize = 1000;
+  type SessionRow = {
+    id: string;
+    session_date: string;
+    attendance_finalized: boolean;
+    class_id: string;
+    classes: { name: string } | { name: string }[] | null;
+  };
+  const sessionsAccum: SessionRow[] = [];
+  for (let start = 0; ; start += pageSize) {
+    let q = supabase
+      .from("sessions")
+      .select("id, session_date, attendance_finalized, class_id, classes(name)")
+      .eq("organization_id", params.organizationId)
+      .gte("session_date", params.dateFrom)
+      .lte("session_date", params.dateTo)
+      .order("id", { ascending: true })
+      .range(start, start + pageSize - 1);
+    if (params.classId) q = q.eq("class_id", params.classId);
+    const { data: sessions, error: sErr } = await q;
+    if (sErr) return [];
+    if (!sessions?.length) break;
+    sessionsAccum.push(...(sessions as SessionRow[]));
+    if (sessions.length < pageSize) break;
+  }
+
+  if (sessionsAccum.length === 0) return [];
+
+  const sessionMeta = new Map<
+    string,
+    { sessionDate: string; finalized: boolean; classId: string; className: string }
+  >();
+  for (const s of sessionsAccum) {
+    const cls = s.classes;
+    const name =
+      cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
+    sessionMeta.set(s.id, {
+      sessionDate: String(s.session_date).slice(0, 10),
+      finalized: s.attendance_finalized,
+      classId: s.class_id,
+      className: name,
+    });
+  }
+
+  const sessionIds = sessionsAccum.map((s) => s.id);
+  type RecRow = {
+    id: string;
+    session_id: string;
+    student_id: string;
+    status: string;
+    marked_at: string;
+    marked_by: string | null;
+    students: { full_name: string } | { full_name: string }[] | null;
+  };
+  const recordsAccum: RecRow[] = [];
+  const inChunk = 200;
+  for (let i = 0; i < sessionIds.length; i += inChunk) {
+    const slice = sessionIds.slice(i, i + inChunk);
+    const { data: records, error: rErr } = await supabase
+      .from("attendance_records")
+      .select("id, session_id, student_id, status, marked_at, marked_by, students(full_name)")
+      .eq("organization_id", params.organizationId)
+      .in("session_id", slice);
+    if (rErr) return [];
+    if (records?.length) recordsAccum.push(...(records as RecRow[]));
+  }
+
+  if (recordsAccum.length === 0) return [];
+
+  const profileNames = new Map<string, string>();
+  const markedByIds = [
+    ...new Set(recordsAccum.map((r) => r.marked_by).filter((x): x is string => Boolean(x))),
+  ];
+  if (markedByIds.length) {
+    const { data: profs } = await supabase.from("profiles").select("id, full_name").in("id", markedByIds);
+    for (const p of profs ?? []) {
+      const pr = p as { id: string; full_name: string };
+      profileNames.set(pr.id, pr.full_name);
+    }
+  }
+
+  const out: AttendanceReportRow[] = [];
+  for (const r of recordsAccum) {
+    const m = sessionMeta.get(r.session_id);
+    if (!m) continue;
+    const st = r.students;
+    const studentName =
+      st && !Array.isArray(st) ? st.full_name : Array.isArray(st) && st[0] ? st[0].full_name : "Student";
+    out.push({
+      id: r.id,
+      studentId: r.student_id,
+      studentName,
+      classId: m.classId,
+      className: m.className,
+      sessionDate: m.sessionDate,
+      status: normalizeAttendanceStatus(r.status),
+      markedAt: r.marked_at,
+      markedByName: r.marked_by ? (profileNames.get(r.marked_by) ?? null) : null,
+      finalized: m.finalized,
+    });
+  }
+  return out.sort((a, b) => {
+    const d = a.sessionDate.localeCompare(b.sessionDate);
+    if (d !== 0) return -d;
+    return a.className.localeCompare(b.className);
+  });
+}
+
+/** Per-student status counts for one class over a session_date range (enrolled roster, zeros when no marks). */
+export type AttendanceClassSummaryRow = {
+  studentId: string;
+  studentName: string;
+  present: number;
+  late: number;
+  absentExcused: number;
+  absentUnexcused: number;
+};
+
+export type AttendanceClassSummaryResult = {
+  className: string;
+  sessionsInRange: number;
+  rows: AttendanceClassSummaryRow[];
+};
+
+export async function fetchAttendanceClassSummaryForOrg(params: {
+  organizationId: string;
+  dateFrom: string;
+  dateTo: string;
+  classId: string;
+}): Promise<AttendanceClassSummaryResult> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) {
+    return { className: "Class", sessionsInRange: 0, rows: [] };
+  }
+
+  const { data: clsRow } = await supabase
+    .from("classes")
+    .select("name")
+    .eq("id", params.classId)
+    .eq("organization_id", params.organizationId)
+    .maybeSingle();
+  const className =
+    clsRow && typeof (clsRow as { name?: string }).name === "string"
+      ? (clsRow as { name: string }).name
+      : "Class";
+
+  const [enrollments, students] = await Promise.all([
+    fetchEnrollmentsForOrg(params.organizationId),
+    fetchStudentsForOrg(params.organizationId),
+  ]);
+  const rosterIds = enrollments.filter((e) => e.classId === params.classId).map((e) => e.studentId);
+  const studentNameById = new Map(students.map((s) => [s.id, s.fullName]));
+
+  type Counts = { present: number; late: number; absentExcused: number; absentUnexcused: number };
+  const emptyCounts = (): Counts => ({
+    present: 0,
+    late: 0,
+    absentExcused: 0,
+    absentUnexcused: 0,
+  });
+  const byStudent = new Map<string, Counts>();
+
+  const buildRows = (): AttendanceClassSummaryRow[] => {
+    const out: AttendanceClassSummaryRow[] = rosterIds.map((studentId) => {
+      const c = byStudent.get(studentId) ?? emptyCounts();
+      return {
+        studentId,
+        studentName: studentNameById.get(studentId) ?? "Student",
+        present: c.present,
+        late: c.late,
+        absentExcused: c.absentExcused,
+        absentUnexcused: c.absentUnexcused,
+      };
+    });
+    out.sort((a, b) => a.studentName.localeCompare(b.studentName));
+    return out;
+  };
+
+  const pageSize = 1000;
+  type SessionRow = { id: string };
+  const sessionsAccum: SessionRow[] = [];
+  for (let start = 0; ; start += pageSize) {
+    const { data: sessions, error: sErr } = await supabase
+      .from("sessions")
+      .select("id")
+      .eq("organization_id", params.organizationId)
+      .eq("class_id", params.classId)
+      .gte("session_date", params.dateFrom)
+      .lte("session_date", params.dateTo)
+      .order("id", { ascending: true })
+      .range(start, start + pageSize - 1);
+    if (sErr) return { className, sessionsInRange: 0, rows: buildRows() };
+    if (!sessions?.length) break;
+    sessionsAccum.push(...(sessions as SessionRow[]));
+    if (sessions.length < pageSize) break;
+  }
+
+  const sessionsInRange = sessionsAccum.length;
+  const sessionIds = sessionsAccum.map((s) => s.id);
+
+  const addStatus = (studentId: string, status: AttendanceStatus) => {
+    let c = byStudent.get(studentId);
+    if (!c) {
+      c = emptyCounts();
+      byStudent.set(studentId, c);
+    }
+    if (status === "present") c.present += 1;
+    else if (status === "late") c.late += 1;
+    else if (status === "absent_excused") c.absentExcused += 1;
+    else c.absentUnexcused += 1;
+  };
+
+  if (sessionIds.length > 0) {
+    type RecRow = { student_id: string; status: string };
+    const inChunk = 200;
+    for (let i = 0; i < sessionIds.length; i += inChunk) {
+      const slice = sessionIds.slice(i, i + inChunk);
+      const { data: records, error: rErr } = await supabase
+        .from("attendance_records")
+        .select("student_id, status")
+        .eq("organization_id", params.organizationId)
+        .in("session_id", slice);
+      if (rErr) return { className, sessionsInRange, rows: buildRows() };
+      for (const r of (records ?? []) as RecRow[]) {
+        addStatus(r.student_id, normalizeAttendanceStatus(r.status));
+      }
+    }
+  }
+
+  return { className, sessionsInRange, rows: buildRows() };
+}
+
+export type AttendanceHistoryRow = {
+  id: string;
+  className: string;
+  sessionDate: string;
+  status: AttendanceStatus;
+  markedAt: string;
+  markedByName: string | null;
+  finalized: boolean;
+};
+
+export async function fetchAttendanceHistoryForStudent(
+  organizationId: string,
+  studentId: string,
+  params?: { dateFrom?: string; dateTo?: string },
+): Promise<AttendanceHistoryRow[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  const dateFrom = params?.dateFrom ?? subDays(new Date(), 90).toISOString().slice(0, 10);
+  const dateTo = params?.dateTo ?? addDays(new Date(), 1).toISOString().slice(0, 10);
+
+  const { data: records, error } = await supabase
+    .from("attendance_records")
+    .select(
+      "id, status, marked_at, marked_by, sessions(session_date, attendance_finalized, classes(name))",
+    )
+    .eq("organization_id", organizationId)
+    .eq("student_id", studentId);
+
+  if (error || !records?.length) return [];
+
+  const profileIds = [
+    ...new Set(
+      (records as { marked_by: string | null }[])
+        .map((r) => r.marked_by)
+        .filter((x): x is string => Boolean(x)),
+    ),
+  ];
+  const names = new Map<string, string>();
+  if (profileIds.length) {
+    const { data: profs } = await supabase.from("profiles").select("id, full_name").in("id", profileIds);
+    for (const p of profs ?? []) {
+      const pr = p as { id: string; full_name: string };
+      names.set(pr.id, pr.full_name);
+    }
+  }
+
+  const out: AttendanceHistoryRow[] = [];
+  for (const raw of records ?? []) {
+    const r = raw as {
+      id: string;
+      status: string;
+      marked_at: string;
+      marked_by: string | null;
+      sessions:
+        | {
+            session_date: string;
+            attendance_finalized: boolean;
+            classes: { name: string } | { name: string }[] | null;
+          }
+        | {
+            session_date: string;
+            attendance_finalized: boolean;
+            classes: { name: string } | { name: string }[] | null;
+          }[]
+        | null;
+    };
+    const sRaw = r.sessions;
+    const s = Array.isArray(sRaw) ? sRaw[0] : sRaw;
+    if (!s) continue;
+    const sessionDate = String(s.session_date).slice(0, 10);
+    if (sessionDate < dateFrom || sessionDate > dateTo) continue;
+    const cls = s.classes;
+    const className =
+      cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
+    out.push({
+      id: r.id,
+      className,
+      sessionDate,
+      status: normalizeAttendanceStatus(r.status),
+      markedAt: r.marked_at,
+      markedByName: r.marked_by ? (names.get(r.marked_by) ?? null) : null,
+      finalized: s.attendance_finalized,
+    });
+  }
+  return out.sort((a, b) => b.sessionDate.localeCompare(a.sessionDate));
+}
+
+export type MissedAttendanceItem = {
+  occurrenceKey: string;
+  classId: string;
+  className: string;
+  startsAt: string;
+  sessionDate: string;
+};
+
+/** Past scheduled occurrences without a finalized attendance session (draft counts as incomplete). */
+export async function fetchMissedAttendanceOccurrences(organizationId: string): Promise<MissedAttendanceItem[]> {
+  const classes = await fetchClassesForOrg(organizationId);
+  const enrollments = await fetchEnrollmentsForOrg(organizationId);
+  const classIdsWithStudents = new Set(
+    enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
+  );
+  const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
+  if (teachable.length === 0) return [];
+
+  const now = new Date();
+  const rangeStart = subDays(now, 30);
+  const rangeEnd = addDays(now, 1);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
+  const past = events.filter((e) => +new Date(e.startsAt) < +now);
+  if (past.length === 0) return [];
+
+  const keys = [...new Set(past.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  const finalizedByKey = new Map<string, boolean>();
+  const chunk = 80;
+  for (let i = 0; i < keys.length; i += chunk) {
+    const slice = keys.slice(i, i + chunk);
+    const { data: sess } = await supabase
+      .from("sessions")
+      .select("occurrence_key, attendance_finalized")
+      .eq("organization_id", organizationId)
+      .in("occurrence_key", slice);
+    for (const row of sess ?? []) {
+      const s = row as { occurrence_key: string; attendance_finalized: boolean };
+      if (!s.occurrence_key) continue;
+      finalizedByKey.set(
+        s.occurrence_key,
+        (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
+      );
+    }
+  }
+
+  const seen = new Set<string>();
+  const missed: MissedAttendanceItem[] = [];
+  for (const e of past) {
+    const key = buildOccurrenceKey(e.classId, e.slotId, e.startsAt);
+    if (finalizedByKey.get(key) === true) continue;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    missed.push({
+      occurrenceKey: key,
+      classId: e.classId,
+      className: e.className,
+      startsAt: e.startsAt,
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+    });
+  }
+  return missed.sort((a, b) => b.startsAt.localeCompare(a.startsAt));
+}
+
+/** Resolve calendar occurrence keys to DB sessions for schedule → attendance deep links. */
+export async function fetchAttendanceOccurrenceStatusMap(
+  organizationId: string,
+  occurrenceKeys: string[],
+): Promise<Record<string, { sessionId: string; attendanceFinalized: boolean }>> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return {};
+  const unique = [...new Set(occurrenceKeys.filter((k) => k.trim().length > 0))];
+  const out: Record<string, { sessionId: string; attendanceFinalized: boolean }> = {};
+  const chunk = 80;
+  for (let i = 0; i < unique.length; i += chunk) {
+    const slice = unique.slice(i, i + chunk);
+    const { data, error } = await supabase
+      .from("sessions")
+      .select("id, occurrence_key, attendance_finalized")
+      .eq("organization_id", organizationId)
+      .in("occurrence_key", slice);
+    if (error || !data) continue;
+    for (const row of data as { id: string; occurrence_key: string | null; attendance_finalized: boolean }[]) {
+      if (!row.occurrence_key) continue;
+      const prev = out[row.occurrence_key];
+      if (!prev) {
+        out[row.occurrence_key] = { sessionId: row.id, attendanceFinalized: row.attendance_finalized };
+      } else {
+        out[row.occurrence_key] = {
+          sessionId: row.id,
+          attendanceFinalized: prev.attendanceFinalized || row.attendance_finalized,
+        };
+      }
+    }
+  }
+  return out;
+}
+
+export type ClassAttendanceSlotRow = {
+  occurrenceKey: string;
+  startsAt: string;
+  sessionDate: string;
+  sessionId: string | null;
+  attendanceFinalized: boolean;
+};
+
+/** Scheduled occurrences for one class with DB session/finalized state (for class detail + catch-up). */
+export async function fetchAttendanceSlotsForClass(
+  organizationId: string,
+  classRoom: ClassRoom,
+): Promise<ClassAttendanceSlotRow[]> {
+  const now = new Date();
+  const rangeStart = subDays(now, 21);
+  /** Expand through today only; then keep slots whose start is already in the past (no upcoming / future weeks). */
+  const rangeEnd = endOfDay(now);
+  const rangeStartMs = +rangeStart;
+  const nowMs = +now;
+  const events = getScheduleEvents([classRoom], rangeStart, rangeEnd).filter((e) => {
+    const t = +new Date(e.startsAt);
+    return !Number.isNaN(t) && t >= rangeStartMs && t < nowMs;
+  });
+  if (events.length === 0) return [];
+
+  const keys = [...new Set(events.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+
+  const byKey = new Map<string, { id: string; attendance_finalized: boolean }>();
+  const chunk = 80;
+  for (let i = 0; i < keys.length; i += chunk) {
+    const slice = keys.slice(i, i + chunk);
+    const { data } = await supabase
+      .from("sessions")
+      .select("id, occurrence_key, attendance_finalized")
+      .eq("organization_id", organizationId)
+      .eq("class_id", classRoom.id)
+      .in("occurrence_key", slice);
+    for (const row of data ?? []) {
+      const r = row as { id: string; occurrence_key: string | null; attendance_finalized: boolean };
+      if (!r.occurrence_key) continue;
+      const prev = byKey.get(r.occurrence_key);
+      if (!prev) {
+        byKey.set(r.occurrence_key, { id: r.id, attendance_finalized: r.attendance_finalized });
+      } else {
+        byKey.set(r.occurrence_key, {
+          id: r.id,
+          attendance_finalized: prev.attendance_finalized || r.attendance_finalized,
+        });
+      }
+    }
+  }
+
+  const rows: ClassAttendanceSlotRow[] = events.map((e) => {
+    const k = buildOccurrenceKey(e.classId, e.slotId, e.startsAt);
+    const s = byKey.get(k);
+    return {
+      occurrenceKey: k,
+      startsAt: e.startsAt,
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+      sessionId: s?.id ?? null,
+      attendanceFinalized: s?.attendance_finalized ?? false,
+    };
+  });
+  rows.sort((a, b) => +new Date(b.startsAt) - +new Date(a.startsAt));
+  return rows.slice(0, 36);
+}
