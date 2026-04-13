@@ -10,6 +10,7 @@ import {
   fetchClassesForOrg,
   fetchEnrollmentsForOrg,
   fetchStudentsForOrg,
+  resolveTeacherClassAccess,
 } from "@/lib/tracker-queries";
 
 export default async function AttendancePage({
@@ -36,14 +37,15 @@ export default async function AttendancePage({
     redirect("/onboarding");
   }
 
+  const access = await resolveTeacherClassAccess(user.id, orgId);
   const [classes, students, enrollments, initialSessionBundle, priorityClasses] = await Promise.all([
-    fetchClassesForOrg(orgId),
+    fetchClassesForOrg(orgId, access),
     fetchStudentsForOrg(orgId),
     fetchEnrollmentsForOrg(orgId),
     sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
       ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
       : Promise.resolve(null),
-    fetchAttendancePriorityClasses(orgId),
+    fetchAttendancePriorityClasses(orgId, access),
   ]);
 
   return (

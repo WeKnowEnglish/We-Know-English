@@ -1,4 +1,5 @@
 import { addDays, endOfDay, format, subDays } from "date-fns";
+import { fetchOrgMembershipRole } from "@/lib/organization-server";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import {
   buildOccurrenceKey,
@@ -26,14 +27,84 @@ export async function verifyOrgMembership(userId: string, organizationId: string
   return Boolean(data);
 }
 
-export async function fetchClassesForOrg(organizationId: string): Promise<ClassRoom[]> {
+/** When set, staff only see classes they lead or are assigned to as co-teachers; owners see all. */
+export type TeacherClassAccess = {
+  userId: string;
+  orgRole: "owner" | "staff" | "client";
+};
+
+/** Build access for `fetchClassesForOrg` from org membership (owners and staff get scoped lists). */
+export function teacherAccessFromMembership(
+  userId: string,
+  orgRole: "owner" | "staff" | "client" | null,
+): TeacherClassAccess | null {
+  if (!orgRole) return null;
+  return { userId, orgRole };
+}
+
+export async function resolveTeacherClassAccess(
+  userId: string,
+  organizationId: string,
+): Promise<TeacherClassAccess | null> {
+  const role = await fetchOrgMembershipRole(userId, organizationId);
+  return teacherAccessFromMembership(userId, role);
+}
+
+export async function teacherHasAccessToClass(
+  organizationId: string,
+  userId: string,
+  orgRole: TeacherClassAccess["orgRole"] | null,
+  classId: string,
+): Promise<boolean> {
+  if (orgRole === "owner") return true;
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return false;
+  const { data: cls, error } = await supabase
+    .from("classes")
+    .select("id, tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (error || !cls) return false;
+  const tutorId = (cls as { tutor_id: string | null }).tutor_id;
+  if (tutorId === userId) return true;
+  const { data: link } = await supabase
+    .from("class_teachers")
+    .select("id")
+    .eq("class_id", classId)
+    .eq("profile_id", userId)
+    .maybeSingle();
+  return Boolean(link);
+}
+
+export async function fetchClassesForOrg(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<ClassRoom[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
-  const { data, error } = await supabase
+
+  let query = supabase
     .from("classes")
     .select("id, name, created_at, settings")
     .eq("organization_id", organizationId)
     .order("created_at", { ascending: false });
+
+  if (access && access.orgRole === "staff") {
+    const { data: ctRows } = await supabase
+      .from("class_teachers")
+      .select("class_id")
+      .eq("organization_id", organizationId)
+      .eq("profile_id", access.userId);
+    const extraIds = [...new Set((ctRows ?? []).map((r) => r.class_id as string))];
+    const orParts = [`tutor_id.eq.${access.userId}`];
+    if (extraIds.length > 0) {
+      orParts.push(`id.in.(${extraIds.join(",")})`);
+    }
+    query = query.or(orParts.join(","));
+  }
+
+  const { data, error } = await query;
   if (error || !data) return [];
   return data.map((row) => classRowToClassRoom(row as Parameters<typeof classRowToClassRoom>[0]));
 }
@@ -72,6 +143,106 @@ export async function fetchClassById(organizationId: string, classId: string): P
     .maybeSingle();
   if (error || !data) return null;
   return classRowToClassRoom(data as Parameters<typeof classRowToClassRoom>[0]);
+}
+
+export type ClassTeacherRosterEntry = {
+  profileId: string;
+  fullName: string;
+  isPrimary: boolean;
+};
+
+export type TeacherPickOption = { profileId: string; fullName: string };
+
+export async function fetchClassTeacherPanelData(
+  organizationId: string,
+  classId: string,
+  viewer: { userId: string; orgRole: TeacherClassAccess["orgRole"] },
+): Promise<{
+  roster: ClassTeacherRosterEntry[];
+  addCandidates: TeacherPickOption[];
+  canManage: boolean;
+  /** Owner or lead instructor — may delete the class. */
+  viewerMayDeleteClass: boolean;
+}> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) {
+    return { roster: [], addCandidates: [], canManage: false, viewerMayDeleteClass: false };
+  }
+
+  const { data: cls, error: clsErr } = await supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (clsErr || !cls) {
+    return { roster: [], addCandidates: [], canManage: false, viewerMayDeleteClass: false };
+  }
+  const tutorId = (cls as { tutor_id: string | null }).tutor_id;
+
+  const { data: tutorProf } = tutorId
+    ? await supabase.from("profiles").select("id, full_name").eq("id", tutorId).maybeSingle()
+    : { data: null };
+  const tutorName = (tutorProf as { full_name: string } | null)?.full_name ?? "Lead instructor";
+
+  const { data: ctRows } = await supabase
+    .from("class_teachers")
+    .select("profile_id, profiles(full_name)")
+    .eq("organization_id", organizationId)
+    .eq("class_id", classId);
+
+  const rosterMap = new Map<string, ClassTeacherRosterEntry>();
+  if (tutorId) {
+    rosterMap.set(tutorId, { profileId: tutorId, fullName: tutorName, isPrimary: true });
+  }
+  for (const raw of ctRows ?? []) {
+    const row = raw as {
+      profile_id: string;
+      profiles: { full_name: string } | { full_name: string }[] | null;
+    };
+    const p = row.profiles;
+    const name = p && !Array.isArray(p) ? p.full_name : Array.isArray(p) && p[0] ? p[0].full_name : "Teacher";
+    const isPrimary = row.profile_id === tutorId;
+    rosterMap.set(row.profile_id, {
+      profileId: row.profile_id,
+      fullName: name,
+      isPrimary,
+    });
+  }
+
+  const roster = [...rosterMap.values()].sort((a, b) => {
+    if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+    return a.fullName.localeCompare(b.fullName);
+  });
+
+  const assigned = new Set(roster.map((r) => r.profileId));
+
+  const { data: members } = await supabase
+    .from("organization_members")
+    .select("profile_id, profiles(full_name, app_role)")
+    .eq("organization_id", organizationId);
+
+  const addCandidates: TeacherPickOption[] = [];
+  for (const raw of members ?? []) {
+    const row = raw as {
+      profile_id: string;
+      profiles: { full_name: string; app_role: string } | { full_name: string; app_role: string }[] | null;
+    };
+    const p = row.profiles;
+    const pr = p && !Array.isArray(p) ? p : Array.isArray(p) ? p[0] : null;
+    if (!pr || pr.app_role !== "teacher") continue;
+    if (assigned.has(row.profile_id)) continue;
+    addCandidates.push({ profileId: row.profile_id, fullName: pr.full_name });
+  }
+  addCandidates.sort((a, b) => a.fullName.localeCompare(b.fullName));
+
+  const canManage =
+    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
+
+  const viewerMayDeleteClass =
+    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
+
+  return { roster, addCandidates, canManage, viewerMayDeleteClass };
 }
 
 export async function fetchStudentById(organizationId: string, studentId: string): Promise<Student | null> {
@@ -334,9 +505,18 @@ export async function fetchAttendanceReportForOrg(params: {
   dateFrom: string;
   dateTo: string;
   classId?: string | null;
+  /** When set (e.g. staff co-teachers), limit sessions to these classes. */
+  allowedClassIds?: string[] | null;
 }): Promise<AttendanceReportRow[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
+
+  if (params.allowedClassIds && params.allowedClassIds.length === 0) return [];
+
+  const allowed =
+    params.allowedClassIds && params.allowedClassIds.length > 0 ? new Set(params.allowedClassIds) : null;
+
+  if (params.classId && allowed && !allowed.has(params.classId)) return [];
 
   /** PostgREST returns at most ~1000 rows per request; paginate so older sessions (e.g. March) are not silently dropped. */
   const pageSize = 1000;
@@ -358,6 +538,7 @@ export async function fetchAttendanceReportForOrg(params: {
       .order("id", { ascending: true })
       .range(start, start + pageSize - 1);
     if (params.classId) q = q.eq("class_id", params.classId);
+    else if (allowed) q = q.in("class_id", [...allowed]);
     const { data: sessions, error: sErr } = await q;
     if (sErr) return [];
     if (!sessions?.length) break;
@@ -668,8 +849,11 @@ export type MissedAttendanceItem = {
 };
 
 /** Past scheduled occurrences without a finalized attendance session (draft counts as incomplete). */
-export async function fetchMissedAttendanceOccurrences(organizationId: string): Promise<MissedAttendanceItem[]> {
-  const classes = await fetchClassesForOrg(organizationId);
+export async function fetchMissedAttendanceOccurrences(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<MissedAttendanceItem[]> {
+  const classes = await fetchClassesForOrg(organizationId, access);
   const enrollments = await fetchEnrollmentsForOrg(organizationId);
   const classIdsWithStudents = new Set(
     enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
@@ -819,8 +1003,11 @@ function betterAttendancePriority(
  * Classes that need attendance attention now: in session, starting within 30 minutes, or recently ended
  * without finalized attendance. Uses schedule + sessions.attendance_finalized (not draft-only heuristics).
  */
-export async function fetchAttendancePriorityClasses(organizationId: string): Promise<AttendancePriorityRow[]> {
-  const classes = await fetchClassesForOrg(organizationId);
+export async function fetchAttendancePriorityClasses(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<AttendancePriorityRow[]> {
+  const classes = await fetchClassesForOrg(organizationId, access);
   const enrollments = await fetchEnrollmentsForOrg(organizationId);
   const classIdsWithStudents = new Set(
     enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),

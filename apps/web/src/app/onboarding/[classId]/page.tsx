@@ -1,12 +1,14 @@
 import { notFound, redirect } from "next/navigation";
 import { ClassDetailClient } from "./class-detail-client";
-import { getOrganizationShellContext } from "@/lib/organization-server";
+import { fetchOrgMembershipRole, getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
 import {
   fetchAttendanceSlotsForClass,
   fetchClassById,
+  fetchClassTeacherPanelData,
   fetchEnrollmentsForOrg,
   fetchStudentsForOrg,
+  teacherHasAccessToClass,
 } from "@/lib/tracker-queries";
 
 export default async function ClassDetailPage({ params }: { params: Promise<{ classId: string }> }) {
@@ -22,15 +24,26 @@ export default async function ClassDetailPage({ params }: { params: Promise<{ cl
     redirect("/onboarding");
   }
 
+  const orgRole = await fetchOrgMembershipRole(user.id, orgId);
+  if (!orgRole) {
+    redirect("/onboarding");
+  }
+
+  const allowed = await teacherHasAccessToClass(orgId, user.id, orgRole, classId);
+  if (!allowed) {
+    notFound();
+  }
+
   const classRoom = await fetchClassById(orgId, classId);
   if (!classRoom) {
     notFound();
   }
 
-  const [students, enrollments, attendanceSlots] = await Promise.all([
+  const [students, enrollments, attendanceSlots, teacherPanel] = await Promise.all([
     fetchStudentsForOrg(orgId),
     fetchEnrollmentsForOrg(orgId),
     fetchAttendanceSlotsForClass(orgId, classRoom),
+    fetchClassTeacherPanelData(orgId, classId, { userId: user.id, orgRole }),
   ]);
 
   return (
@@ -41,6 +54,7 @@ export default async function ClassDetailPage({ params }: { params: Promise<{ cl
       initialStudents={students}
       initialEnrollments={enrollments}
       initialAttendanceSlots={attendanceSlots}
+      initialTeacherPanel={teacherPanel}
     />
   );
 }

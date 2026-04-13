@@ -7,6 +7,7 @@ import {
   fetchAttendanceClassSummaryForOrg,
   fetchAttendanceReportForOrg,
   fetchClassesForOrg,
+  resolveTeacherClassAccess,
 } from "@/lib/tracker-queries";
 
 export default async function AttendanceReportPage({
@@ -35,9 +36,18 @@ export default async function AttendanceReportPage({
   const viewRaw = typeof sp.view === "string" ? sp.view.toLowerCase() : "";
   const view = viewRaw === "summary" ? "summary" : "detail";
 
-  const [classes, rows, summaryResult] = await Promise.all([
-    fetchClassesForOrg(orgId),
-    fetchAttendanceReportForOrg({ organizationId: orgId, dateFrom, dateTo, classId }),
+  const access = await resolveTeacherClassAccess(user.id, orgId);
+  const classes = await fetchClassesForOrg(orgId, access);
+  const allowedClassIds = access?.orgRole === "staff" ? classes.map((c) => c.id) : undefined;
+
+  const [rows, summaryResult] = await Promise.all([
+    fetchAttendanceReportForOrg({
+      organizationId: orgId,
+      dateFrom,
+      dateTo,
+      classId,
+      allowedClassIds,
+    }),
     view === "summary" && classId
       ? fetchAttendanceClassSummaryForOrg({
           organizationId: orgId,

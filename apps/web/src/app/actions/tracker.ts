@@ -1,6 +1,7 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { fetchOrgMembershipRole } from "@/lib/organization-server";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { classRoomToSettingsPatch, studentToProfilePatch } from "@/lib/tracker-mappers";
 import { verifyOrgMembership } from "@/lib/tracker-queries";
@@ -22,6 +23,50 @@ async function requireTeacherOrg(organizationId: string) {
   const ok = await verifyOrgMembership(user.id, organizationId);
   if (!ok) return { supabase, userId: user.id, ok: false as const };
   return { supabase, userId: user.id, ok: true as const };
+}
+
+async function canTeacherActOnClass(
+  supabase: NonNullable<Awaited<ReturnType<typeof createServerSupabaseClient>>>,
+  organizationId: string,
+  userId: string,
+  classId: string,
+): Promise<boolean> {
+  const orgRole = await fetchOrgMembershipRole(userId, organizationId);
+  if (!orgRole) return false;
+  if (orgRole === "owner") return true;
+  const { data: cls } = await supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (!cls) return false;
+  if ((cls as { tutor_id: string | null }).tutor_id === userId) return true;
+  const { data: ct } = await supabase
+    .from("class_teachers")
+    .select("id")
+    .eq("class_id", classId)
+    .eq("profile_id", userId)
+    .maybeSingle();
+  return Boolean(ct);
+}
+
+async function canManageClassTeachers(
+  supabase: NonNullable<Awaited<ReturnType<typeof createServerSupabaseClient>>>,
+  organizationId: string,
+  userId: string,
+  classId: string,
+): Promise<boolean> {
+  const orgRole = await fetchOrgMembershipRole(userId, organizationId);
+  if (orgRole === "owner") return true;
+  if (orgRole !== "staff") return false;
+  const { data: cls } = await supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  return Boolean(cls && (cls as { tutor_id: string | null }).tutor_id === userId);
 }
 
 function generateJoinCode(existing: Set<string>): string {
@@ -83,15 +128,27 @@ export async function createClassAction(
 
   if (error || !data) return { ok: false, error: error?.message ?? "Insert failed" };
 
+  const newId = data.id as string;
+  await ctx.supabase.from("class_teachers").insert({
+    organization_id: organizationId,
+    class_id: newId,
+    profile_id: ctx.userId,
+  });
+
   revalidatePath("/onboarding");
   revalidatePath("/");
   revalidatePath("/schedule");
-  return { ok: true, classId: data.id as string };
+  return { ok: true, classId: newId };
 }
 
 export async function updateClassesOrderAction(organizationId: string, orderedIds: string[]): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const orgRole = await fetchOrgMembershipRole(ctx.userId, organizationId);
+  if (orgRole !== "owner") {
+    return { ok: false, error: "Only the organization owner can reorder classes for everyone." };
+  }
 
   const { data: rows } = await ctx.supabase.from("classes").select("id, settings").eq("organization_id", organizationId);
   const byId = new Map((rows ?? []).map((r) => [r.id as string, r]));
@@ -108,7 +165,20 @@ export async function updateClassesOrderAction(organizationId: string, orderedId
 
 export async function deleteClassAction(organizationId: string, classId: string): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const orgRole = await fetchOrgMembershipRole(ctx.userId, organizationId);
+  if (orgRole !== "owner") {
+    const { data: cls } = await ctx.supabase
+      .from("classes")
+      .select("tutor_id")
+      .eq("id", classId)
+      .eq("organization_id", organizationId)
+      .maybeSingle();
+    if (!cls || (cls as { tutor_id: string | null }).tutor_id !== ctx.userId) {
+      return { ok: false, error: "Only the owner or the lead instructor can delete this class." };
+    }
+  }
 
   const { error } = await ctx.supabase.from("classes").delete().eq("id", classId).eq("organization_id", organizationId);
   if (error) return { ok: false, error: error.message };
@@ -121,7 +191,10 @@ export async function deleteClassAction(organizationId: string, classId: string)
 
 export async function upsertClassPayloadAction(organizationId: string, classRoom: ClassRoom): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, classRoom.id);
+  if (!allowed) return { ok: false, error: "You do not have access to edit this class." };
 
   const settings = classRoomToSettingsPatch(classRoom);
   const { error } = await ctx.supabase
@@ -187,6 +260,8 @@ export async function createStudentAction(
 
   const studentId = studentRow.id as string;
   if (input.classId !== "none") {
+    const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, input.classId);
+    if (!allowed) return { ok: false, error: "You do not have access to enroll students in that class." };
     const { error: enrErr } = await ctx.supabase.from("enrollments").insert({
       organization_id: organizationId,
       class_id: input.classId,
@@ -218,7 +293,10 @@ export async function setEnrollmentsForClassAction(
   next: StudentClassEnrollment[],
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!allowed) return { ok: false, error: "Unauthorized" };
 
   const { data: existing } = await ctx.supabase.from("enrollments").select("id, student_id").eq("organization_id", organizationId).eq("class_id", classId);
 
@@ -252,7 +330,10 @@ export async function addEnrollmentAction(
   studentId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!allowed) return { ok: false, error: "Unauthorized" };
 
   const { error } = await ctx.supabase.from("enrollments").insert({
     organization_id: organizationId,
@@ -274,7 +355,10 @@ export async function removeEnrollmentAction(
   studentId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!allowed) return { ok: false, error: "Unauthorized" };
 
   const { error } = await ctx.supabase
     .from("enrollments")
@@ -293,12 +377,101 @@ export async function removeAllEnrollmentsForClassAction(
   classId: string,
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const allowed = await canTeacherActOnClass(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!allowed) return { ok: false, error: "Unauthorized" };
 
   const { error } = await ctx.supabase.from("enrollments").delete().eq("organization_id", organizationId).eq("class_id", classId);
   if (error) return { ok: false, error: error.message };
   revalidatePath("/onboarding");
   revalidatePath("/students");
+  return { ok: true };
+}
+
+export async function addClassTeacherAction(
+  organizationId: string,
+  classId: string,
+  profileId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ctx = await requireTeacherOrg(organizationId);
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const canManage = await canManageClassTeachers(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!canManage) return { ok: false, error: "Only the owner or lead instructor can add teachers." };
+
+  const { data: mem } = await ctx.supabase
+    .from("organization_members")
+    .select("profile_id")
+    .eq("organization_id", organizationId)
+    .eq("profile_id", profileId)
+    .maybeSingle();
+  if (!mem) return { ok: false, error: "That person is not a member of this organization." };
+
+  const { data: prof } = await ctx.supabase.from("profiles").select("app_role").eq("id", profileId).maybeSingle();
+  if ((prof as { app_role?: string } | null)?.app_role !== "teacher") {
+    return { ok: false, error: "Only teacher accounts can be assigned to a class." };
+  }
+
+  const { data: cls } = await ctx.supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("id", classId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  const tutorId = (cls as { tutor_id: string | null } | null)?.tutor_id;
+  if (tutorId === profileId) {
+    return { ok: false, error: "That teacher is already the lead instructor for this class." };
+  }
+
+  const { error } = await ctx.supabase.from("class_teachers").insert({
+    organization_id: organizationId,
+    class_id: classId,
+    profile_id: profileId,
+  });
+  if (error) {
+    if (error.code === "23505") return { ok: false, error: "That teacher is already assigned to this class." };
+    return { ok: false, error: error.message };
+  }
+  revalidatePath("/onboarding");
+  revalidatePath(`/onboarding/${classId}`);
+  revalidatePath("/schedule");
+  return { ok: true };
+}
+
+export async function removeClassTeacherAction(
+  organizationId: string,
+  classId: string,
+  profileId: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const ctx = await requireTeacherOrg(organizationId);
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const canManage = await canManageClassTeachers(ctx.supabase, organizationId, ctx.userId, classId);
+  if (!canManage) return { ok: false, error: "Only the owner or lead instructor can remove teachers." };
+
+  const { data: cls } = await ctx.supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("id", classId)
+    .eq("organization_id", organizationId)
+    .maybeSingle();
+  const tutorId = (cls as { tutor_id: string | null } | null)?.tutor_id;
+  if (profileId === tutorId) {
+    return { ok: false, error: "The lead instructor cannot be removed here." };
+  }
+
+  const { error } = await ctx.supabase
+    .from("class_teachers")
+    .delete()
+    .eq("organization_id", organizationId)
+    .eq("class_id", classId)
+    .eq("profile_id", profileId);
+  if (error) return { ok: false, error: error.message };
+
+  revalidatePath("/onboarding");
+  revalidatePath(`/onboarding/${classId}`);
+  revalidatePath("/schedule");
   return { ok: true };
 }
 

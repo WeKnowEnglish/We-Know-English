@@ -6,7 +6,7 @@ import { TeacherHomePanel } from "@/components/teacher-home-panel";
 import { getNavGroupsForRole } from "@/lib/nav";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { fetchClassesForOrg, fetchStudentEnrollmentClasses } from "@/lib/tracker-queries";
+import { fetchClassesForOrg, fetchStudentEnrollmentClasses, resolveTeacherClassAccess } from "@/lib/tracker-queries";
 
 function toDisplayName(value: string) {
   return value
@@ -46,7 +46,8 @@ export default async function Home() {
   if (isTeacherView && user?.id) {
     const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole: "teacher" });
     if (orgCtx.activeOrganizationId) {
-      const all = await fetchClassesForOrg(orgCtx.activeOrganizationId);
+      const access = await resolveTeacherClassAccess(user.id, orgCtx.activeOrganizationId);
+      const all = await fetchClassesForOrg(orgCtx.activeOrganizationId, access);
       recentClasses = [...all]
         .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
         .slice(0, 3);
