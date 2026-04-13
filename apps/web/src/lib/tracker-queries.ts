@@ -3,6 +3,7 @@ import { fetchOrgMembershipRole } from "@/lib/organization-server";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import {
   buildOccurrenceKey,
+  classHasDefinedSchedule,
   getScheduleEvents,
   parseOccurrenceKey,
   sessionDateFromScheduleInstant,
@@ -866,28 +867,31 @@ export async function fetchMissedAttendanceOccurrences(
   const rangeEnd = addDays(now, 1);
   const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
   const past = events.filter((e) => +new Date(e.startsAt) < +now);
-  if (past.length === 0) return [];
 
-  const keys = [...new Set(past.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
 
+  const teachableById = new Map(teachable.map((c) => [c.id, c]));
+
   const finalizedByKey = new Map<string, boolean>();
-  const chunk = 80;
-  for (let i = 0; i < keys.length; i += chunk) {
-    const slice = keys.slice(i, i + chunk);
-    const { data: sess } = await supabase
-      .from("sessions")
-      .select("occurrence_key, attendance_finalized")
-      .eq("organization_id", organizationId)
-      .in("occurrence_key", slice);
-    for (const row of sess ?? []) {
-      const s = row as { occurrence_key: string; attendance_finalized: boolean };
-      if (!s.occurrence_key) continue;
-      finalizedByKey.set(
-        s.occurrence_key,
-        (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
-      );
+  if (past.length > 0) {
+    const keys = [...new Set(past.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+    const chunk = 80;
+    for (let i = 0; i < keys.length; i += chunk) {
+      const slice = keys.slice(i, i + chunk);
+      const { data: sess } = await supabase
+        .from("sessions")
+        .select("occurrence_key, attendance_finalized")
+        .eq("organization_id", organizationId)
+        .in("occurrence_key", slice);
+      for (const row of sess ?? []) {
+        const s = row as { occurrence_key: string; attendance_finalized: boolean };
+        if (!s.occurrence_key) continue;
+        finalizedByKey.set(
+          s.occurrence_key,
+          (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
+        );
+      }
     }
   }
 
@@ -908,9 +912,9 @@ export async function fetchMissedAttendanceOccurrences(
   }
 
   /**
-   * Scheduled occurrences are expanded using the server runtime timezone (often UTC on Vercel), while
-   * attendance rows store `occurrence_key` from the teacher’s browser. Merge non-finalized past sessions
-   * from the DB so missed attendance still lists April 13 (etc.) when schedule expansion omits them.
+   * Merge non-finalized `sessions` rows when schedule expansion missed them (timezone/server).
+   * Skip classes with no defined schedule so draft rows from old tests do not linger after the calendar
+   * is cleared — those rows remain in the DB until deleted or finalized.
    */
   if (supabase) {
     const cutoffStr = format(subDays(now, 60), "yyyy-MM-dd");
@@ -932,6 +936,9 @@ export async function fetchMissedAttendanceOccurrences(
         classes: { name: string } | { name: string }[] | null;
       };
       if (!teachableIds.has(row.class_id)) continue;
+      const classRoom = teachableById.get(row.class_id);
+      if (!classRoom || !classHasDefinedSchedule(classRoom)) continue;
+
       const cls = row.classes;
       const className =
         cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : null;

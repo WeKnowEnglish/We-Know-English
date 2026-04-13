@@ -157,6 +157,15 @@ export function normalizeClassForRead(classRoom: ClassRoom): ClassRoom {
   return { ...classRoom, scheduleSlots: [] };
 }
 
+/** Whether the class still has any calendar source (slots, weekly pattern, or legacy next session). */
+export function classHasDefinedSchedule(classRoom: ClassRoom): boolean {
+  const n = normalizeClassForRead(classRoom);
+  if (Array.isArray(n.scheduleSlots) && n.scheduleSlots.length > 0) return true;
+  if (getWeeklyRulesFromClass(n).length > 0) return true;
+  if (n.nextSessionAt?.trim()) return true;
+  return false;
+}
+
 function finalizeRoom(c: ClassRoom): ClassRoom {
   const updatedAt = new Date().toISOString();
   const next = { ...c, updatedAt };
