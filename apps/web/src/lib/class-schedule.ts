@@ -316,6 +316,22 @@ export function parseOccurrenceKey(
 }
 
 /**
+ * Local calendar day embedded in weekly slot ids (`weekly_<classId>_<ruleId>_YYYY-MM-DD`).
+ * Matches the teacher-facing day even when the ISO tail of `occurrence_key` falls on the next UTC/local calendar day.
+ */
+export function embeddedCalendarDayFromOccurrenceKey(occurrenceKey: string | null | undefined): string | null {
+  const k = occurrenceKey?.trim();
+  if (!k) return null;
+  const first = k.indexOf("|");
+  const last = k.lastIndexOf("|");
+  if (first < 0 || last <= first) return null;
+  const slotId = k.slice(first + 1, last);
+  if (!slotId.startsWith("weekly_")) return null;
+  const m = /_(\d{4}-\d{2}-\d{2})$/.exec(slotId);
+  return m ? m[1] : null;
+}
+
+/**
  * Pick the best schedule row for "take attendance now": next upcoming in-window, else most recent past in range.
  */
 export function pickPrimaryAttendanceOccurrence(classRoom: ClassRoom, now: Date = new Date()): ScheduleEvent | null {

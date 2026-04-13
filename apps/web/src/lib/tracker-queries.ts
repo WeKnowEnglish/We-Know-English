@@ -4,6 +4,7 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import {
   buildOccurrenceKey,
   classHasDefinedSchedule,
+  embeddedCalendarDayFromOccurrenceKey,
   getScheduleEvents,
   parseOccurrenceKey,
   sessionDateFromScheduleInstant,
@@ -501,6 +502,33 @@ export type AttendanceReportRow = {
   finalized: boolean;
 };
 
+/** Include session if `session_date` or occurrence-derived day falls in [from, to] (fixes weekly TZ skew vs report filter). */
+function sessionQualifiesForReportDateRange(
+  row: { session_date: string; occurrence_key: string | null },
+  from: string,
+  to: string,
+): boolean {
+  const sd = String(row.session_date).slice(0, 10);
+  if (sd >= from && sd <= to) return true;
+  const emb = embeddedCalendarDayFromOccurrenceKey(row.occurrence_key);
+  if (emb && emb >= from && emb <= to) return true;
+  const k = row.occurrence_key?.trim();
+  if (k) {
+    const p = parseOccurrenceKey(k);
+    if (p) {
+      const utcDay = p.startsAt.toISOString().slice(0, 10);
+      if (utcDay >= from && utcDay <= to) return true;
+    }
+  }
+  return false;
+}
+
+function reportSessionDateForDisplay(row: { session_date: string; occurrence_key: string | null }): string {
+  const emb = embeddedCalendarDayFromOccurrenceKey(row.occurrence_key);
+  if (emb) return emb;
+  return String(row.session_date).slice(0, 10);
+}
+
 export async function fetchAttendanceReportForOrg(params: {
   organizationId: string;
   dateFrom: string;
@@ -519,11 +547,15 @@ export async function fetchAttendanceReportForOrg(params: {
 
   if (params.classId && allowed && !allowed.has(params.classId)) return [];
 
+  const widenFrom = format(subDays(new Date(`${params.dateFrom}T12:00:00`), 3), "yyyy-MM-dd");
+  const widenTo = format(addDays(new Date(`${params.dateTo}T12:00:00`), 3), "yyyy-MM-dd");
+
   /** PostgREST returns at most ~1000 rows per request; paginate so older sessions (e.g. March) are not silently dropped. */
   const pageSize = 1000;
   type SessionRow = {
     id: string;
     session_date: string;
+    occurrence_key: string | null;
     attendance_finalized: boolean;
     class_id: string;
     classes: { name: string } | { name: string }[] | null;
@@ -532,10 +564,10 @@ export async function fetchAttendanceReportForOrg(params: {
   for (let start = 0; ; start += pageSize) {
     let q = supabase
       .from("sessions")
-      .select("id, session_date, attendance_finalized, class_id, classes(name)")
+      .select("id, session_date, occurrence_key, attendance_finalized, class_id, classes(name)")
       .eq("organization_id", params.organizationId)
-      .gte("session_date", params.dateFrom)
-      .lte("session_date", params.dateTo)
+      .gte("session_date", widenFrom)
+      .lte("session_date", widenTo)
       .order("id", { ascending: true })
       .range(start, start + pageSize - 1);
     if (params.classId) q = q.eq("class_id", params.classId);
@@ -547,25 +579,39 @@ export async function fetchAttendanceReportForOrg(params: {
     if (sessions.length < pageSize) break;
   }
 
-  if (sessionsAccum.length === 0) return [];
+  const inRange = sessionsAccum.filter((s) =>
+    sessionQualifiesForReportDateRange(
+      {
+        session_date: s.session_date,
+        occurrence_key: s.occurrence_key,
+      },
+      params.dateFrom,
+      params.dateTo,
+    ),
+  );
+
+  if (inRange.length === 0) return [];
 
   const sessionMeta = new Map<
     string,
     { sessionDate: string; finalized: boolean; classId: string; className: string }
   >();
-  for (const s of sessionsAccum) {
+  for (const s of inRange) {
     const cls = s.classes;
     const name =
       cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
     sessionMeta.set(s.id, {
-      sessionDate: String(s.session_date).slice(0, 10),
+      sessionDate: reportSessionDateForDisplay({
+        session_date: s.session_date,
+        occurrence_key: s.occurrence_key,
+      }),
       finalized: s.attendance_finalized,
       classId: s.class_id,
       className: name,
     });
   }
 
-  const sessionIds = sessionsAccum.map((s) => s.id);
+  const sessionIds = inRange.map((s) => s.id);
   type RecRow = {
     id: string;
     session_id: string;
@@ -699,17 +745,20 @@ export async function fetchAttendanceClassSummaryForOrg(params: {
     return out;
   };
 
+  const widenFrom = format(subDays(new Date(`${params.dateFrom}T12:00:00`), 3), "yyyy-MM-dd");
+  const widenTo = format(addDays(new Date(`${params.dateTo}T12:00:00`), 3), "yyyy-MM-dd");
+
   const pageSize = 1000;
-  type SessionRow = { id: string };
+  type SessionRow = { id: string; session_date: string; occurrence_key: string | null };
   const sessionsAccum: SessionRow[] = [];
   for (let start = 0; ; start += pageSize) {
     const { data: sessions, error: sErr } = await supabase
       .from("sessions")
-      .select("id")
+      .select("id, session_date, occurrence_key")
       .eq("organization_id", params.organizationId)
       .eq("class_id", params.classId)
-      .gte("session_date", params.dateFrom)
-      .lte("session_date", params.dateTo)
+      .gte("session_date", widenFrom)
+      .lte("session_date", widenTo)
       .order("id", { ascending: true })
       .range(start, start + pageSize - 1);
     if (sErr) return { className, sessionsInRange: 0, rows: buildRows() };
@@ -718,8 +767,16 @@ export async function fetchAttendanceClassSummaryForOrg(params: {
     if (sessions.length < pageSize) break;
   }
 
-  const sessionsInRange = sessionsAccum.length;
-  const sessionIds = sessionsAccum.map((s) => s.id);
+  const inRange = sessionsAccum.filter((s) =>
+    sessionQualifiesForReportDateRange(
+      { session_date: s.session_date, occurrence_key: s.occurrence_key },
+      params.dateFrom,
+      params.dateTo,
+    ),
+  );
+
+  const sessionsInRange = inRange.length;
+  const sessionIds = inRange.map((s) => s.id);
 
   const addStatus = (studentId: string, status: AttendanceStatus) => {
     let c = byStudent.get(studentId);
