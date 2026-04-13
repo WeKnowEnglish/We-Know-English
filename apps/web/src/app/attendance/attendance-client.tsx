@@ -22,12 +22,11 @@ import {
 } from "@/lib/attendance-utils";
 import {
   buildOccurrenceKey,
-  nextSessionInstantOrNull,
   parseOccurrenceKey,
   pickPrimaryAttendanceOccurrence,
   sessionDateFromScheduleInstant,
 } from "@/lib/class-schedule";
-import type { AttendanceSessionBundle } from "@/lib/tracker-queries";
+import type { AttendancePriorityRow, AttendanceSessionBundle } from "@/lib/tracker-queries";
 import type { AttendanceStatus, ClassRoom, Student, StudentClassEnrollment } from "@/lib/tracker-types";
 import { Button } from "@/components/ui/button";
 import { buttonVariants } from "@/components/ui/button-variants";
@@ -36,8 +35,6 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { cn } from "@/lib/utils";
 
 const EMPTY_ATTENDANCE: Record<string, AttendanceStatus> = {};
-const TWENTY_FOUR_HOURS_MS = 24 * 60 * 60 * 1000;
-const SEVENTY_TWO_HOURS_MS = 72 * 60 * 60 * 1000;
 
 const classListNextSessionFormatter = new Intl.DateTimeFormat("en-US", {
   month: "short",
@@ -61,9 +58,17 @@ const sessionDateOnlyFormatter = new Intl.DateTimeFormat("en-US", {
   year: "numeric",
 });
 
-function formatClassNextSessionLabel(classRoom: ClassRoom): string {
-  const next = nextSessionInstantOrNull(classRoom);
-  return next ? classListNextSessionFormatter.format(next) : "Not scheduled";
+function priorityKindLabel(kind: AttendancePriorityRow["kind"]): string {
+  switch (kind) {
+    case "in_session":
+      return "In session";
+    case "imminent":
+      return "Starting soon";
+    case "missed":
+      return "Needs catch-up";
+    default:
+      return "";
+  }
 }
 
 type SaveUiState = "idle" | "saving" | "saved" | "error";
@@ -73,6 +78,8 @@ export type AttendanceClientProps = {
   initialClasses: ClassRoom[];
   initialStudents: Student[];
   initialEnrollments: StudentClassEnrollment[];
+  /** Server-resolved classes that need attendance (in window / recent missed, not finalized). */
+  priorityClasses: AttendancePriorityRow[];
   initialSessionBundle: AttendanceSessionBundle | null;
   classIdFromQuery: string | null;
   sessionIdFromQuery: string | null;
@@ -86,6 +93,7 @@ export function AttendanceClient({
   initialClasses,
   initialStudents,
   initialEnrollments,
+  priorityClasses,
   initialSessionBundle,
   classIdFromQuery,
   sessionIdFromQuery,
@@ -122,42 +130,7 @@ export function AttendanceClient({
   const attendanceRef = useRef(attendance);
   const lastPersistedSnapshotRef = useRef<string | null>(null);
 
-  const orderedClasses = useMemo(() => {
-    return [...classes].sort((a, b) => {
-      const aTime = nextSessionInstantOrNull(a)?.getTime() ?? +new Date(a.updatedAt);
-      const bTime = nextSessionInstantOrNull(b)?.getTime() ?? +new Date(b.updatedAt);
-      return aTime - bTime;
-    });
-  }, [classes]);
-
-  const classHasEnrollments = useCallback(
-    (classId: string) => enrollments.some((e) => e.classId === classId),
-    [enrollments],
-  );
-
-  const isClassUnlocked = useCallback(
-    (classRoom: ClassRoom) => {
-      if (!classHasEnrollments(classRoom.id)) return false;
-      const nowMs = Date.now();
-      const nextInstant = nextSessionInstantOrNull(classRoom);
-      if (nextInstant) {
-        const delta = nextInstant.getTime() - nowMs;
-        if (delta >= 0 && delta <= TWENTY_FOUR_HOURS_MS) return true;
-      }
-      const occ = pickPrimaryAttendanceOccurrence(classRoom);
-      if (!occ) return false;
-      const t = +new Date(occ.startsAt);
-      if (t <= nowMs && nowMs - t <= SEVENTY_TWO_HOURS_MS) return true;
-      return false;
-    },
-    [classHasEnrollments],
-  );
-
-  const classAvailability = useMemo(() => {
-    return new Map(orderedClasses.map((c) => [c.id, isClassUnlocked(c)]));
-  }, [orderedClasses, isClassUnlocked]);
-
-  const activeClass = orderedClasses.find((c) => c.id === activeClassId) ?? null;
+  const activeClass = classes.find((c) => c.id === activeClassId) ?? null;
   const classRoster = useMemo(() => {
     if (!activeClassId) return [];
     const ids = new Set(enrollments.filter((e) => e.classId === activeClassId).map((e) => e.studentId));
@@ -410,8 +383,50 @@ export function AttendanceClient({
     return acc;
   }, [attendance]);
 
-  const startClassAttendance = (classId: string) => {
-    const classRoom = orderedClasses.find((c) => c.id === classId);
+  const startClassAttendance = (
+    classId: string,
+    preset?: { occurrenceKey: string; sessionDate: string } | null,
+  ) => {
+    const resolvedPreset = preset?.occurrenceKey?.trim() && preset?.sessionDate?.trim()
+      ? { occurrenceKey: preset.occurrenceKey.trim(), sessionDate: preset.sessionDate.trim() }
+      : null;
+
+    if (resolvedPreset) {
+      const { occurrenceKey: key, sessionDate: sd } = resolvedPreset;
+      const defaults = createDefaultAttendanceForClass(classId);
+      setActiveClassId(classId);
+      setOccurrenceKey(key);
+      setSessionDate(sd);
+      setAttendance(defaults);
+      setFinalized(false);
+      startTransition(async () => {
+        const res = await saveAttendanceBundleAction({
+          organizationId,
+          classId,
+          sessionId: null,
+          occurrenceKey: key,
+          sessionDate: sd,
+          rows: Object.entries(defaults).map(([studentId, status]) => ({ studentId, status })),
+        });
+        if (!res.ok) {
+          setSaveMessage(res.error);
+          setSaveUi("error");
+          return;
+        }
+        setSessionKey(res.sessionId);
+        lastPersistedSnapshotRef.current = rosterAttendanceSnapshot(defaults, Object.keys(defaults));
+        router.replace(
+          buildAttendanceUrl({
+            classId,
+            sessionId: res.sessionId,
+            returnTo: returnToForChainedNav,
+          }),
+        );
+      });
+      return;
+    }
+
+    const classRoom = classes.find((c) => c.id === classId);
     const occ = classRoom ? pickPrimaryAttendanceOccurrence(classRoom) : null;
     if (!classRoom || !occ) {
       const defaults = createDefaultAttendanceForClass(classId);
@@ -561,33 +576,63 @@ export function AttendanceClient({
           </div>
           <Card>
           <CardHeader>
-            <CardTitle className="text-base">Classes</CardTitle>
-            <CardDescription>Ordered by next upcoming class date. Unlocks within 24h of next class or within 72h after.</CardDescription>
+            <CardTitle className="text-base">Classes needing attention</CardTitle>
+            <CardDescription>
+              In session, starting within 30 minutes, or finished recently without finalized attendance (last 72 hours).
+              Finalized sessions are hidden here.
+            </CardDescription>
           </CardHeader>
           <CardContent className="space-y-2">
-            {orderedClasses.length > 0 ? (
-              orderedClasses.map((classRoom) => (
+            {priorityClasses.length > 0 ? (
+              priorityClasses.map((row) => (
                 <button
-                  key={classRoom.id}
+                  key={`${row.classId}-${row.occurrenceKey}`}
                   type="button"
-                  disabled={!classAvailability.get(classRoom.id)}
-                  onClick={() => startClassAttendance(classRoom.id)}
-                  className={cn(
-                    "flex w-full items-center justify-between rounded-lg border border-border px-3 py-2 text-left transition-colors",
-                    classAvailability.get(classRoom.id) ? "hover:bg-accent/40" : "cursor-not-allowed opacity-60",
-                  )}
+                  onClick={() =>
+                    startClassAttendance(row.classId, {
+                      occurrenceKey: row.occurrenceKey,
+                      sessionDate: row.sessionDate,
+                    })
+                  }
+                  className="flex w-full items-center justify-between gap-3 rounded-lg border border-border px-3 py-2 text-left transition-colors hover:bg-accent/40"
                 >
-                  <div>
-                    <p className="font-medium">{classRoom.name}</p>
-                    <p className="text-sm text-muted-foreground">Next: {formatClassNextSessionLabel(classRoom)}</p>
+                  <div className="min-w-0">
+                    <p className="font-medium">{row.className}</p>
+                    <p className="text-sm text-muted-foreground">
+                      {classListNextSessionFormatter.format(new Date(row.startsAt))}
+                    </p>
                   </div>
-                  <Badge variant="outline">
-                    {classAvailability.get(classRoom.id) ? "Start attendance" : "Locked"}
+                  <Badge
+                    variant="outline"
+                    className={cn(
+                      "shrink-0",
+                      row.kind === "in_session" && "border-emerald-500/50 text-emerald-800 dark:text-emerald-200",
+                      row.kind === "imminent" && "border-amber-500/50 text-amber-900 dark:text-amber-100",
+                      row.kind === "missed" && "border-sky-500/50 text-sky-900 dark:text-sky-100",
+                    )}
+                  >
+                    {priorityKindLabel(row.kind)}
                   </Badge>
                 </button>
               ))
             ) : (
-              <p className="text-sm text-muted-foreground">No classes available yet.</p>
+              <div className="space-y-3 text-sm text-muted-foreground">
+                <p>No classes need attendance at this moment.</p>
+                <p>
+                  Use{" "}
+                  <Link href="/schedule" className="font-medium text-foreground underline underline-offset-2">
+                    Schedule
+                  </Link>{" "}
+                  for other dates, or{" "}
+                  <Link
+                    href="/attendance/missed"
+                    className="font-medium text-foreground underline underline-offset-2"
+                  >
+                    Missed sessions
+                  </Link>{" "}
+                  for older catch-up.
+                </p>
+              </div>
             )}
           </CardContent>
         </Card>

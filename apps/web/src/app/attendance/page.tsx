@@ -5,6 +5,7 @@ import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
 import { isSessionUuid } from "@/lib/attendance-utils";
 import {
+  fetchAttendancePriorityClasses,
   fetchAttendanceSessionBundle,
   fetchClassesForOrg,
   fetchEnrollmentsForOrg,
@@ -35,13 +36,14 @@ export default async function AttendancePage({
     redirect("/onboarding");
   }
 
-  const [classes, students, enrollments, initialSessionBundle] = await Promise.all([
+  const [classes, students, enrollments, initialSessionBundle, priorityClasses] = await Promise.all([
     fetchClassesForOrg(orgId),
     fetchStudentsForOrg(orgId),
     fetchEnrollmentsForOrg(orgId),
     sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
       ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
       : Promise.resolve(null),
+    fetchAttendancePriorityClasses(orgId),
   ]);
 
   return (
@@ -57,6 +59,7 @@ export default async function AttendancePage({
         initialClasses={classes}
         initialStudents={students}
         initialEnrollments={enrollments}
+        priorityClasses={priorityClasses}
         initialSessionBundle={initialSessionBundle}
         classIdFromQuery={classIdFromQuery}
         sessionIdFromQuery={sessionIdFromQuery}

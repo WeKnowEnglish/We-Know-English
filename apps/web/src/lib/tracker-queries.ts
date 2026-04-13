@@ -1,6 +1,11 @@
-import { addDays, endOfDay, subDays } from "date-fns";
+import { addDays, endOfDay, format, subDays } from "date-fns";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { buildOccurrenceKey, getScheduleEvents, sessionDateFromScheduleInstant } from "@/lib/class-schedule";
+import {
+  buildOccurrenceKey,
+  getScheduleEvents,
+  parseOccurrenceKey,
+  sessionDateFromScheduleInstant,
+} from "@/lib/class-schedule";
 import { normalizeAttendanceStatus } from "@/lib/attendance-utils";
 import {
   classRowToClassRoom,
@@ -717,7 +722,185 @@ export async function fetchMissedAttendanceOccurrences(organizationId: string): 
       sessionDate: sessionDateFromScheduleInstant(e.startsAt),
     });
   }
+
+  /**
+   * Scheduled occurrences are expanded using the server runtime timezone (often UTC on Vercel), while
+   * attendance rows store `occurrence_key` from the teacher’s browser. Merge non-finalized past sessions
+   * from the DB so missed attendance still lists April 13 (etc.) when schedule expansion omits them.
+   */
+  if (supabase) {
+    const cutoffStr = format(subDays(now, 60), "yyyy-MM-dd");
+    const todayStr = format(now, "yyyy-MM-dd");
+    const teachableIds = new Set(teachable.map((c) => c.id));
+    const { data: dbRows } = await supabase
+      .from("sessions")
+      .select("occurrence_key, session_date, class_id, classes(name)")
+      .eq("organization_id", organizationId)
+      .eq("attendance_finalized", false)
+      .lte("session_date", todayStr)
+      .gte("session_date", cutoffStr);
+
+    for (const raw of dbRows ?? []) {
+      const row = raw as {
+        occurrence_key: string | null;
+        session_date: string;
+        class_id: string;
+        classes: { name: string } | { name: string }[] | null;
+      };
+      if (!teachableIds.has(row.class_id)) continue;
+      const cls = row.classes;
+      const className =
+        cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : null;
+      if (!className) continue;
+
+      const occ = row.occurrence_key?.trim();
+      if (!occ) continue;
+
+      const parsed = parseOccurrenceKey(occ);
+      if (!parsed) continue;
+      const startMs = +parsed.startsAt;
+      if (Number.isNaN(startMs) || startMs >= +now) continue;
+
+      if (seen.has(occ)) continue;
+      seen.add(occ);
+
+      missed.push({
+        occurrenceKey: occ,
+        classId: row.class_id,
+        className,
+        startsAt: parsed.startsAt.toISOString(),
+        sessionDate: sessionDateFromScheduleInstant(parsed.startsAt),
+      });
+    }
+  }
+
   return missed.sort((a, b) => b.startsAt.localeCompare(a.startsAt));
+}
+
+/** Default session length when computing “in session” / “missed” windows (matches typical class block). */
+const DEFAULT_CLASS_DURATION_MS = 50 * 60 * 1000;
+/** “Starting soon” — class begins within this window from now. */
+const ATTENDANCE_IMMINENT_MS = 30 * 60 * 1000;
+/** After class end, still show as catch-up for this long. */
+const ATTENDANCE_MISSED_RECENT_MS = 72 * 60 * 60 * 1000;
+
+export type AttendancePriorityRow = {
+  classId: string;
+  className: string;
+  occurrenceKey: string;
+  startsAt: string;
+  sessionDate: string;
+  kind: "in_session" | "imminent" | "missed";
+};
+
+function attendanceKindForInstant(
+  nowMs: number,
+  startMs: number,
+  durationMs: number,
+): "in_session" | "imminent" | "missed" | null {
+  const endMs = startMs + durationMs;
+  if (nowMs >= startMs && nowMs < endMs) return "in_session";
+  if (nowMs < startMs && startMs <= nowMs + ATTENDANCE_IMMINENT_MS) return "imminent";
+  if (nowMs >= endMs && nowMs - endMs <= ATTENDANCE_MISSED_RECENT_MS) return "missed";
+  return null;
+}
+
+function betterAttendancePriority(
+  a: { kind: "in_session" | "imminent" | "missed"; startMs: number },
+  b: { kind: "in_session" | "imminent" | "missed"; startMs: number },
+): boolean {
+  const order = { in_session: 0, imminent: 1, missed: 2 };
+  if (order[a.kind] !== order[b.kind]) return order[a.kind] < order[b.kind];
+  if (a.kind === "missed") return a.startMs > b.startMs;
+  return a.startMs < b.startMs;
+}
+
+/**
+ * Classes that need attendance attention now: in session, starting within 30 minutes, or recently ended
+ * without finalized attendance. Uses schedule + sessions.attendance_finalized (not draft-only heuristics).
+ */
+export async function fetchAttendancePriorityClasses(organizationId: string): Promise<AttendancePriorityRow[]> {
+  const classes = await fetchClassesForOrg(organizationId);
+  const enrollments = await fetchEnrollmentsForOrg(organizationId);
+  const classIdsWithStudents = new Set(
+    enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
+  );
+  const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
+  if (teachable.length === 0) return [];
+
+  const now = new Date();
+  const nowMs = +now;
+  const rangeStart = subDays(now, 5);
+  const rangeEnd = addDays(now, 2);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
+  if (events.length === 0) return [];
+
+  const keys = [...new Set(events.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+  const finalizedByKey = new Map<string, boolean>();
+  const supabase = await createServerSupabaseClient();
+  if (supabase) {
+    const chunk = 80;
+    for (let i = 0; i < keys.length; i += chunk) {
+      const slice = keys.slice(i, i + chunk);
+      const { data: sess } = await supabase
+        .from("sessions")
+        .select("occurrence_key, attendance_finalized")
+        .eq("organization_id", organizationId)
+        .in("occurrence_key", slice);
+      for (const row of sess ?? []) {
+        const s = row as { occurrence_key: string; attendance_finalized: boolean };
+        if (!s.occurrence_key) continue;
+        finalizedByKey.set(
+          s.occurrence_key,
+          (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
+        );
+      }
+    }
+  }
+
+  const bestByClass = new Map<
+    string,
+    { kind: "in_session" | "imminent" | "missed"; startMs: number; event: (typeof events)[0] }
+  >();
+
+  for (const e of events) {
+    const startMs = +new Date(e.startsAt);
+    if (Number.isNaN(startMs)) continue;
+    const key = buildOccurrenceKey(e.classId, e.slotId, e.startsAt);
+    if (finalizedByKey.get(key) === true) continue;
+
+    const kind = attendanceKindForInstant(nowMs, startMs, DEFAULT_CLASS_DURATION_MS);
+    if (!kind) continue;
+
+    const prev = bestByClass.get(e.classId);
+    const candidate = { kind, startMs, event: e };
+    if (!prev || betterAttendancePriority(candidate, prev)) {
+      bestByClass.set(e.classId, candidate);
+    }
+  }
+
+  const rows: AttendancePriorityRow[] = [];
+  for (const { kind, event } of bestByClass.values()) {
+    rows.push({
+      classId: event.classId,
+      className: event.className,
+      occurrenceKey: buildOccurrenceKey(event.classId, event.slotId, event.startsAt),
+      startsAt: event.startsAt,
+      sessionDate: sessionDateFromScheduleInstant(event.startsAt),
+      kind,
+    });
+  }
+
+  const kindRank = { in_session: 0, imminent: 1, missed: 2 };
+  rows.sort((a, b) => {
+    const d = kindRank[a.kind] - kindRank[b.kind];
+    if (d !== 0) return d;
+    const ta = +new Date(a.startsAt);
+    const tb = +new Date(b.startsAt);
+    if (a.kind === "missed") return tb - ta;
+    return ta - tb;
+  });
+  return rows;
 }
 
 /** Resolve calendar occurrence keys to DB sessions for schedule → attendance deep links. */
