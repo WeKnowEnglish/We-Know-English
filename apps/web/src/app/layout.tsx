@@ -5,7 +5,7 @@ import { SiteFooter } from "@/components/site-footer";
 import { SupabaseSetupBanner } from "@/components/supabase-setup-banner";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { fetchMissedAttendanceOccurrences } from "@/lib/tracker-queries";
+import { fetchMissedAttendanceOccurrences, resolveTeacherClassAccess } from "@/lib/tracker-queries";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -32,7 +32,10 @@ export default async function RootLayout({
   const orgCtx = await getOrganizationShellContext({ userId: user?.id ?? null, appRole });
   const missedAttendance =
     user && appRole === "teacher" && orgCtx.activeOrganizationId
-      ? await fetchMissedAttendanceOccurrences(orgCtx.activeOrganizationId)
+      ? await fetchMissedAttendanceOccurrences(
+          orgCtx.activeOrganizationId,
+          await resolveTeacherClassAccess(user.id, orgCtx.activeOrganizationId),
+        )
       : [];
 
   return (

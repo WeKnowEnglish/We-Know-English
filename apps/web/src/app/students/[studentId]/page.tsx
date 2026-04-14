@@ -7,6 +7,7 @@ import {
   fetchClassesForOrg,
   fetchEnrollmentsForOrg,
   fetchStudentById,
+  resolveTeacherClassAccess,
 } from "@/lib/tracker-queries";
 
 export default async function StudentTeacherViewPage({ params }: { params: Promise<{ studentId: string }> }) {
@@ -22,9 +23,10 @@ export default async function StudentTeacherViewPage({ params }: { params: Promi
     redirect("/onboarding");
   }
 
+  const access = await resolveTeacherClassAccess(user.id, orgId);
   const [student, classes, enrollments, attendanceHistory] = await Promise.all([
     fetchStudentById(orgId, studentId),
-    fetchClassesForOrg(orgId),
+    fetchClassesForOrg(orgId, access),
     fetchEnrollmentsForOrg(orgId),
     fetchAttendanceHistoryForStudent(orgId, studentId),
   ]);

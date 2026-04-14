@@ -1,6 +1,15 @@
-import { addDays, endOfDay, subDays } from "date-fns";
+import { addDays, endOfDay, format, subDays } from "date-fns";
+import { fetchOrgMembershipRole } from "@/lib/organization-server";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { buildOccurrenceKey, getScheduleEvents, sessionDateFromScheduleInstant } from "@/lib/class-schedule";
+import {
+  buildOccurrenceKey,
+  classHasDefinedSchedule,
+  embeddedCalendarDayFromOccurrenceKey,
+  getScheduleEvents,
+  parseOccurrenceKey,
+  sessionDateFromScheduleInstant,
+} from "@/lib/class-schedule";
 import { normalizeAttendanceStatus } from "@/lib/attendance-utils";
 import {
   classRowToClassRoom,
@@ -21,14 +30,84 @@ export async function verifyOrgMembership(userId: string, organizationId: string
   return Boolean(data);
 }
 
-export async function fetchClassesForOrg(organizationId: string): Promise<ClassRoom[]> {
+/** When set, staff only see classes they lead or are assigned to as co-teachers; owners see all. */
+export type TeacherClassAccess = {
+  userId: string;
+  orgRole: "owner" | "staff" | "client";
+};
+
+/** Build access for `fetchClassesForOrg` from org membership (owners and staff get scoped lists). */
+export function teacherAccessFromMembership(
+  userId: string,
+  orgRole: "owner" | "staff" | "client" | null,
+): TeacherClassAccess | null {
+  if (!orgRole) return null;
+  return { userId, orgRole };
+}
+
+export async function resolveTeacherClassAccess(
+  userId: string,
+  organizationId: string,
+): Promise<TeacherClassAccess | null> {
+  const role = await fetchOrgMembershipRole(userId, organizationId);
+  return teacherAccessFromMembership(userId, role);
+}
+
+export async function teacherHasAccessToClass(
+  organizationId: string,
+  userId: string,
+  orgRole: TeacherClassAccess["orgRole"] | null,
+  classId: string,
+): Promise<boolean> {
+  if (orgRole === "owner") return true;
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return false;
+  const { data: cls, error } = await supabase
+    .from("classes")
+    .select("id, tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (error || !cls) return false;
+  const tutorId = (cls as { tutor_id: string | null }).tutor_id;
+  if (tutorId === userId) return true;
+  const { data: link } = await supabase
+    .from("class_teachers")
+    .select("id")
+    .eq("class_id", classId)
+    .eq("profile_id", userId)
+    .maybeSingle();
+  return Boolean(link);
+}
+
+export async function fetchClassesForOrg(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<ClassRoom[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
-  const { data, error } = await supabase
+
+  let query = supabase
     .from("classes")
     .select("id, name, created_at, settings")
     .eq("organization_id", organizationId)
     .order("created_at", { ascending: false });
+
+  if (access && access.orgRole === "staff") {
+    const { data: ctRows } = await supabase
+      .from("class_teachers")
+      .select("class_id")
+      .eq("organization_id", organizationId)
+      .eq("profile_id", access.userId);
+    const extraIds = [...new Set((ctRows ?? []).map((r) => r.class_id as string))];
+    const orParts = [`tutor_id.eq.${access.userId}`];
+    if (extraIds.length > 0) {
+      orParts.push(`id.in.(${extraIds.join(",")})`);
+    }
+    query = query.or(orParts.join(","));
+  }
+
+  const { data, error } = await query;
   if (error || !data) return [];
   return data.map((row) => classRowToClassRoom(row as Parameters<typeof classRowToClassRoom>[0]));
 }
@@ -67,6 +146,106 @@ export async function fetchClassById(organizationId: string, classId: string): P
     .maybeSingle();
   if (error || !data) return null;
   return classRowToClassRoom(data as Parameters<typeof classRowToClassRoom>[0]);
+}
+
+export type ClassTeacherRosterEntry = {
+  profileId: string;
+  fullName: string;
+  isPrimary: boolean;
+};
+
+export type TeacherPickOption = { profileId: string; fullName: string };
+
+export async function fetchClassTeacherPanelData(
+  organizationId: string,
+  classId: string,
+  viewer: { userId: string; orgRole: TeacherClassAccess["orgRole"] },
+): Promise<{
+  roster: ClassTeacherRosterEntry[];
+  addCandidates: TeacherPickOption[];
+  canManage: boolean;
+  /** Owner or lead instructor — may delete the class. */
+  viewerMayDeleteClass: boolean;
+}> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) {
+    return { roster: [], addCandidates: [], canManage: false, viewerMayDeleteClass: false };
+  }
+
+  const { data: cls, error: clsErr } = await supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  if (clsErr || !cls) {
+    return { roster: [], addCandidates: [], canManage: false, viewerMayDeleteClass: false };
+  }
+  const tutorId = (cls as { tutor_id: string | null }).tutor_id;
+
+  const { data: tutorProf } = tutorId
+    ? await supabase.from("profiles").select("id, full_name").eq("id", tutorId).maybeSingle()
+    : { data: null };
+  const tutorName = (tutorProf as { full_name: string } | null)?.full_name ?? "Lead instructor";
+
+  const { data: ctRows } = await supabase
+    .from("class_teachers")
+    .select("profile_id, profiles(full_name)")
+    .eq("organization_id", organizationId)
+    .eq("class_id", classId);
+
+  const rosterMap = new Map<string, ClassTeacherRosterEntry>();
+  if (tutorId) {
+    rosterMap.set(tutorId, { profileId: tutorId, fullName: tutorName, isPrimary: true });
+  }
+  for (const raw of ctRows ?? []) {
+    const row = raw as {
+      profile_id: string;
+      profiles: { full_name: string } | { full_name: string }[] | null;
+    };
+    const p = row.profiles;
+    const name = p && !Array.isArray(p) ? p.full_name : Array.isArray(p) && p[0] ? p[0].full_name : "Teacher";
+    const isPrimary = row.profile_id === tutorId;
+    rosterMap.set(row.profile_id, {
+      profileId: row.profile_id,
+      fullName: name,
+      isPrimary,
+    });
+  }
+
+  const roster = [...rosterMap.values()].sort((a, b) => {
+    if (a.isPrimary !== b.isPrimary) return a.isPrimary ? -1 : 1;
+    return a.fullName.localeCompare(b.fullName);
+  });
+
+  const assigned = new Set(roster.map((r) => r.profileId));
+
+  const { data: members } = await supabase
+    .from("organization_members")
+    .select("profile_id, profiles(full_name, app_role)")
+    .eq("organization_id", organizationId);
+
+  const addCandidates: TeacherPickOption[] = [];
+  for (const raw of members ?? []) {
+    const row = raw as {
+      profile_id: string;
+      profiles: { full_name: string; app_role: string } | { full_name: string; app_role: string }[] | null;
+    };
+    const p = row.profiles;
+    const pr = p && !Array.isArray(p) ? p : Array.isArray(p) ? p[0] : null;
+    if (!pr || pr.app_role !== "teacher") continue;
+    if (assigned.has(row.profile_id)) continue;
+    addCandidates.push({ profileId: row.profile_id, fullName: pr.full_name });
+  }
+  addCandidates.sort((a, b) => a.fullName.localeCompare(b.fullName));
+
+  const canManage =
+    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
+
+  const viewerMayDeleteClass =
+    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
+
+  return { roster, addCandidates, canManage, viewerMayDeleteClass };
 }
 
 export async function fetchStudentById(organizationId: string, studentId: string): Promise<Student | null> {
@@ -324,20 +503,60 @@ export type AttendanceReportRow = {
   finalized: boolean;
 };
 
+/** Include session if `session_date` or occurrence-derived day falls in [from, to] (fixes weekly TZ skew vs report filter). */
+function sessionQualifiesForReportDateRange(
+  row: { session_date: string; occurrence_key: string | null },
+  from: string,
+  to: string,
+): boolean {
+  const sd = String(row.session_date).slice(0, 10);
+  if (sd >= from && sd <= to) return true;
+  const emb = embeddedCalendarDayFromOccurrenceKey(row.occurrence_key);
+  if (emb && emb >= from && emb <= to) return true;
+  const k = row.occurrence_key?.trim();
+  if (k) {
+    const p = parseOccurrenceKey(k);
+    if (p) {
+      const utcDay = p.startsAt.toISOString().slice(0, 10);
+      if (utcDay >= from && utcDay <= to) return true;
+    }
+  }
+  return false;
+}
+
+function reportSessionDateForDisplay(row: { session_date: string; occurrence_key: string | null }): string {
+  const emb = embeddedCalendarDayFromOccurrenceKey(row.occurrence_key);
+  if (emb) return emb;
+  return String(row.session_date).slice(0, 10);
+}
+
 export async function fetchAttendanceReportForOrg(params: {
   organizationId: string;
   dateFrom: string;
   dateTo: string;
   classId?: string | null;
+  /** When set (e.g. staff co-teachers), limit sessions to these classes. */
+  allowedClassIds?: string[] | null;
 }): Promise<AttendanceReportRow[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
+
+  if (params.allowedClassIds && params.allowedClassIds.length === 0) return [];
+
+  const allowed =
+    params.allowedClassIds && params.allowedClassIds.length > 0 ? new Set(params.allowedClassIds) : null;
+
+  if (params.classId && allowed && !allowed.has(params.classId)) return [];
+
+  const widenFrom = format(subDays(new Date(`${params.dateFrom}T12:00:00`), 3), "yyyy-MM-dd");
+  const widenTo = format(addDays(new Date(`${params.dateTo}T12:00:00`), 3), "yyyy-MM-dd");
 
   /** PostgREST returns at most ~1000 rows per request; paginate so older sessions (e.g. March) are not silently dropped. */
   const pageSize = 1000;
   type SessionRow = {
     id: string;
     session_date: string;
+    occurrence_key: string | null;
     attendance_finalized: boolean;
     class_id: string;
     classes: { name: string } | { name: string }[] | null;
@@ -346,13 +565,14 @@ export async function fetchAttendanceReportForOrg(params: {
   for (let start = 0; ; start += pageSize) {
     let q = supabase
       .from("sessions")
-      .select("id, session_date, attendance_finalized, class_id, classes(name)")
+      .select("id, session_date, occurrence_key, attendance_finalized, class_id, classes(name)")
       .eq("organization_id", params.organizationId)
-      .gte("session_date", params.dateFrom)
-      .lte("session_date", params.dateTo)
+      .gte("session_date", widenFrom)
+      .lte("session_date", widenTo)
       .order("id", { ascending: true })
       .range(start, start + pageSize - 1);
     if (params.classId) q = q.eq("class_id", params.classId);
+    else if (allowed) q = q.in("class_id", [...allowed]);
     const { data: sessions, error: sErr } = await q;
     if (sErr) return [];
     if (!sessions?.length) break;
@@ -360,25 +580,39 @@ export async function fetchAttendanceReportForOrg(params: {
     if (sessions.length < pageSize) break;
   }
 
-  if (sessionsAccum.length === 0) return [];
+  const inRange = sessionsAccum.filter((s) =>
+    sessionQualifiesForReportDateRange(
+      {
+        session_date: s.session_date,
+        occurrence_key: s.occurrence_key,
+      },
+      params.dateFrom,
+      params.dateTo,
+    ),
+  );
+
+  if (inRange.length === 0) return [];
 
   const sessionMeta = new Map<
     string,
     { sessionDate: string; finalized: boolean; classId: string; className: string }
   >();
-  for (const s of sessionsAccum) {
+  for (const s of inRange) {
     const cls = s.classes;
     const name =
       cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
     sessionMeta.set(s.id, {
-      sessionDate: String(s.session_date).slice(0, 10),
+      sessionDate: reportSessionDateForDisplay({
+        session_date: s.session_date,
+        occurrence_key: s.occurrence_key,
+      }),
       finalized: s.attendance_finalized,
       classId: s.class_id,
       className: name,
     });
   }
 
-  const sessionIds = sessionsAccum.map((s) => s.id);
+  const sessionIds = inRange.map((s) => s.id);
   type RecRow = {
     id: string;
     session_id: string;
@@ -512,17 +746,20 @@ export async function fetchAttendanceClassSummaryForOrg(params: {
     return out;
   };
 
+  const widenFrom = format(subDays(new Date(`${params.dateFrom}T12:00:00`), 3), "yyyy-MM-dd");
+  const widenTo = format(addDays(new Date(`${params.dateTo}T12:00:00`), 3), "yyyy-MM-dd");
+
   const pageSize = 1000;
-  type SessionRow = { id: string };
+  type SessionRow = { id: string; session_date: string; occurrence_key: string | null };
   const sessionsAccum: SessionRow[] = [];
   for (let start = 0; ; start += pageSize) {
     const { data: sessions, error: sErr } = await supabase
       .from("sessions")
-      .select("id")
+      .select("id, session_date, occurrence_key")
       .eq("organization_id", params.organizationId)
       .eq("class_id", params.classId)
-      .gte("session_date", params.dateFrom)
-      .lte("session_date", params.dateTo)
+      .gte("session_date", widenFrom)
+      .lte("session_date", widenTo)
       .order("id", { ascending: true })
       .range(start, start + pageSize - 1);
     if (sErr) return { className, sessionsInRange: 0, rows: buildRows() };
@@ -531,8 +768,16 @@ export async function fetchAttendanceClassSummaryForOrg(params: {
     if (sessions.length < pageSize) break;
   }
 
-  const sessionsInRange = sessionsAccum.length;
-  const sessionIds = sessionsAccum.map((s) => s.id);
+  const inRange = sessionsAccum.filter((s) =>
+    sessionQualifiesForReportDateRange(
+      { session_date: s.session_date, occurrence_key: s.occurrence_key },
+      params.dateFrom,
+      params.dateTo,
+    ),
+  );
+
+  const sessionsInRange = inRange.length;
+  const sessionIds = inRange.map((s) => s.id);
 
   const addStatus = (studentId: string, status: AttendanceStatus) => {
     let c = byStudent.get(studentId);
@@ -663,8 +908,11 @@ export type MissedAttendanceItem = {
 };
 
 /** Past scheduled occurrences without a finalized attendance session (draft counts as incomplete). */
-export async function fetchMissedAttendanceOccurrences(organizationId: string): Promise<MissedAttendanceItem[]> {
-  const classes = await fetchClassesForOrg(organizationId);
+export async function fetchMissedAttendanceOccurrences(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<MissedAttendanceItem[]> {
+  const classes = await fetchClassesForOrg(organizationId, access);
   const enrollments = await fetchEnrollmentsForOrg(organizationId);
   const classIdsWithStudents = new Set(
     enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
@@ -672,33 +920,37 @@ export async function fetchMissedAttendanceOccurrences(organizationId: string): 
   const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
   if (teachable.length === 0) return [];
 
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
   const now = new Date();
   const rangeStart = subDays(now, 30);
   const rangeEnd = addDays(now, 1);
-  const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd, tz);
   const past = events.filter((e) => +new Date(e.startsAt) < +now);
-  if (past.length === 0) return [];
 
-  const keys = [...new Set(past.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
 
+  const teachableById = new Map(teachable.map((c) => [c.id, c]));
+
   const finalizedByKey = new Map<string, boolean>();
-  const chunk = 80;
-  for (let i = 0; i < keys.length; i += chunk) {
-    const slice = keys.slice(i, i + chunk);
-    const { data: sess } = await supabase
-      .from("sessions")
-      .select("occurrence_key, attendance_finalized")
-      .eq("organization_id", organizationId)
-      .in("occurrence_key", slice);
-    for (const row of sess ?? []) {
-      const s = row as { occurrence_key: string; attendance_finalized: boolean };
-      if (!s.occurrence_key) continue;
-      finalizedByKey.set(
-        s.occurrence_key,
-        (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
-      );
+  if (past.length > 0) {
+    const keys = [...new Set(past.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+    const chunk = 80;
+    for (let i = 0; i < keys.length; i += chunk) {
+      const slice = keys.slice(i, i + chunk);
+      const { data: sess } = await supabase
+        .from("sessions")
+        .select("occurrence_key, attendance_finalized")
+        .eq("organization_id", organizationId)
+        .in("occurrence_key", slice);
+      for (const row of sess ?? []) {
+        const s = row as { occurrence_key: string; attendance_finalized: boolean };
+        if (!s.occurrence_key) continue;
+        finalizedByKey.set(
+          s.occurrence_key,
+          (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
+        );
+      }
     }
   }
 
@@ -714,10 +966,195 @@ export async function fetchMissedAttendanceOccurrences(organizationId: string): 
       classId: e.classId,
       className: e.className,
       startsAt: e.startsAt,
-      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt, tz),
     });
   }
+
+  /**
+   * Merge non-finalized `sessions` rows when schedule expansion missed them (timezone/server).
+   * Skip classes with no defined schedule so draft rows from old tests do not linger after the calendar
+   * is cleared — those rows remain in the DB until deleted or finalized.
+   */
+  if (supabase) {
+    const cutoffStr = format(subDays(now, 60), "yyyy-MM-dd");
+    const todayStr = format(now, "yyyy-MM-dd");
+    const teachableIds = new Set(teachable.map((c) => c.id));
+    const { data: dbRows } = await supabase
+      .from("sessions")
+      .select("occurrence_key, session_date, class_id, classes(name)")
+      .eq("organization_id", organizationId)
+      .eq("attendance_finalized", false)
+      .lte("session_date", todayStr)
+      .gte("session_date", cutoffStr);
+
+    for (const raw of dbRows ?? []) {
+      const row = raw as {
+        occurrence_key: string | null;
+        session_date: string;
+        class_id: string;
+        classes: { name: string } | { name: string }[] | null;
+      };
+      if (!teachableIds.has(row.class_id)) continue;
+      const classRoom = teachableById.get(row.class_id);
+      if (!classRoom || !classHasDefinedSchedule(classRoom)) continue;
+
+      const cls = row.classes;
+      const className =
+        cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : null;
+      if (!className) continue;
+
+      const occ = row.occurrence_key?.trim();
+      if (!occ) continue;
+
+      const parsed = parseOccurrenceKey(occ);
+      if (!parsed) continue;
+      const startMs = +parsed.startsAt;
+      if (Number.isNaN(startMs) || startMs >= +now) continue;
+
+      if (seen.has(occ)) continue;
+      seen.add(occ);
+
+      missed.push({
+        occurrenceKey: occ,
+        classId: row.class_id,
+        className,
+        startsAt: parsed.startsAt.toISOString(),
+        sessionDate: sessionDateFromScheduleInstant(parsed.startsAt, tz),
+      });
+    }
+  }
+
   return missed.sort((a, b) => b.startsAt.localeCompare(a.startsAt));
+}
+
+/** Default session length when computing “in session” / “missed” windows (matches typical class block). */
+const DEFAULT_CLASS_DURATION_MS = 50 * 60 * 1000;
+/** “Starting soon” — class begins within this window from now. */
+const ATTENDANCE_IMMINENT_MS = 30 * 60 * 1000;
+/** After class end, still show as catch-up for this long. */
+const ATTENDANCE_MISSED_RECENT_MS = 72 * 60 * 60 * 1000;
+
+export type AttendancePriorityRow = {
+  classId: string;
+  className: string;
+  occurrenceKey: string;
+  startsAt: string;
+  sessionDate: string;
+  kind: "in_session" | "imminent" | "missed";
+};
+
+function attendanceKindForInstant(
+  nowMs: number,
+  startMs: number,
+  durationMs: number,
+): "in_session" | "imminent" | "missed" | null {
+  const endMs = startMs + durationMs;
+  if (nowMs >= startMs && nowMs < endMs) return "in_session";
+  if (nowMs < startMs && startMs <= nowMs + ATTENDANCE_IMMINENT_MS) return "imminent";
+  if (nowMs >= endMs && nowMs - endMs <= ATTENDANCE_MISSED_RECENT_MS) return "missed";
+  return null;
+}
+
+function betterAttendancePriority(
+  a: { kind: "in_session" | "imminent" | "missed"; startMs: number },
+  b: { kind: "in_session" | "imminent" | "missed"; startMs: number },
+): boolean {
+  const order = { in_session: 0, imminent: 1, missed: 2 };
+  if (order[a.kind] !== order[b.kind]) return order[a.kind] < order[b.kind];
+  if (a.kind === "missed") return a.startMs > b.startMs;
+  return a.startMs < b.startMs;
+}
+
+/**
+ * Classes that need attendance attention now: in session, starting within 30 minutes, or recently ended
+ * without finalized attendance. Uses schedule + sessions.attendance_finalized (not draft-only heuristics).
+ */
+export async function fetchAttendancePriorityClasses(
+  organizationId: string,
+  access: TeacherClassAccess | null = null,
+): Promise<AttendancePriorityRow[]> {
+  const classes = await fetchClassesForOrg(organizationId, access);
+  const enrollments = await fetchEnrollmentsForOrg(organizationId);
+  const classIdsWithStudents = new Set(
+    enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
+  );
+  const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
+  if (teachable.length === 0) return [];
+
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
+  const now = new Date();
+  const nowMs = +now;
+  const rangeStart = subDays(now, 5);
+  const rangeEnd = addDays(now, 2);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd, tz);
+  if (events.length === 0) return [];
+
+  const keys = [...new Set(events.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
+  const finalizedByKey = new Map<string, boolean>();
+  const supabase = await createServerSupabaseClient();
+  if (supabase) {
+    const chunk = 80;
+    for (let i = 0; i < keys.length; i += chunk) {
+      const slice = keys.slice(i, i + chunk);
+      const { data: sess } = await supabase
+        .from("sessions")
+        .select("occurrence_key, attendance_finalized")
+        .eq("organization_id", organizationId)
+        .in("occurrence_key", slice);
+      for (const row of sess ?? []) {
+        const s = row as { occurrence_key: string; attendance_finalized: boolean };
+        if (!s.occurrence_key) continue;
+        finalizedByKey.set(
+          s.occurrence_key,
+          (finalizedByKey.get(s.occurrence_key) ?? false) || s.attendance_finalized,
+        );
+      }
+    }
+  }
+
+  const bestByClass = new Map<
+    string,
+    { kind: "in_session" | "imminent" | "missed"; startMs: number; event: (typeof events)[0] }
+  >();
+
+  for (const e of events) {
+    const startMs = +new Date(e.startsAt);
+    if (Number.isNaN(startMs)) continue;
+    const key = buildOccurrenceKey(e.classId, e.slotId, e.startsAt);
+    if (finalizedByKey.get(key) === true) continue;
+
+    const kind = attendanceKindForInstant(nowMs, startMs, DEFAULT_CLASS_DURATION_MS);
+    if (!kind) continue;
+
+    const prev = bestByClass.get(e.classId);
+    const candidate = { kind, startMs, event: e };
+    if (!prev || betterAttendancePriority(candidate, prev)) {
+      bestByClass.set(e.classId, candidate);
+    }
+  }
+
+  const rows: AttendancePriorityRow[] = [];
+  for (const { kind, event } of bestByClass.values()) {
+    rows.push({
+      classId: event.classId,
+      className: event.className,
+      occurrenceKey: buildOccurrenceKey(event.classId, event.slotId, event.startsAt),
+      startsAt: event.startsAt,
+      sessionDate: sessionDateFromScheduleInstant(event.startsAt, tz),
+      kind,
+    });
+  }
+
+  const kindRank = { in_session: 0, imminent: 1, missed: 2 };
+  rows.sort((a, b) => {
+    const d = kindRank[a.kind] - kindRank[b.kind];
+    if (d !== 0) return d;
+    const ta = +new Date(a.startsAt);
+    const tb = +new Date(b.startsAt);
+    if (a.kind === "missed") return tb - ta;
+    return ta - tb;
+  });
+  return rows;
 }
 
 /** Resolve calendar occurrence keys to DB sessions for schedule → attendance deep links. */
@@ -767,13 +1204,14 @@ export async function fetchAttendanceSlotsForClass(
   organizationId: string,
   classRoom: ClassRoom,
 ): Promise<ClassAttendanceSlotRow[]> {
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
   const now = new Date();
   const rangeStart = subDays(now, 21);
   /** Expand through today only; then keep slots whose start is already in the past (no upcoming / future weeks). */
   const rangeEnd = endOfDay(now);
   const rangeStartMs = +rangeStart;
   const nowMs = +now;
-  const events = getScheduleEvents([classRoom], rangeStart, rangeEnd).filter((e) => {
+  const events = getScheduleEvents([classRoom], rangeStart, rangeEnd, tz).filter((e) => {
     const t = +new Date(e.startsAt);
     return !Number.isNaN(t) && t >= rangeStartMs && t < nowMs;
   });
@@ -814,7 +1252,7 @@ export async function fetchAttendanceSlotsForClass(
     return {
       occurrenceKey: k,
       startsAt: e.startsAt,
-      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt, tz),
       sessionId: s?.id ?? null,
       attendanceFinalized: s?.attendance_finalized ?? false,
     };

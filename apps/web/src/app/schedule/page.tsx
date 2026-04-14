@@ -2,7 +2,8 @@ import { redirect } from "next/navigation";
 import { ScheduleClient } from "@/app/schedule/schedule-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { fetchClassesForOrg } from "@/lib/tracker-queries";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
+import { fetchClassesForOrg, resolveTeacherClassAccess } from "@/lib/tracker-queries";
 
 export default async function SchedulePage() {
   const { user, appRole } = await getSession();
@@ -16,6 +17,10 @@ export default async function SchedulePage() {
     redirect("/onboarding");
   }
 
-  const classes = await fetchClassesForOrg(orgId);
-  return <ScheduleClient organizationId={orgId} initialClasses={classes} />;
+  const access = await resolveTeacherClassAccess(user.id, orgId);
+  const [classes, scheduleTimeZone] = await Promise.all([
+    fetchClassesForOrg(orgId, access),
+    getScheduleTimezoneForOrganization(orgId),
+  ]);
+  return <ScheduleClient organizationId={orgId} scheduleTimeZone={scheduleTimeZone} initialClasses={classes} />;
 }

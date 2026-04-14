@@ -189,3 +189,35 @@ export async function rejectJoinRequestAction(
   if (orgId) revalidatePath(`/organizations/${orgId}`);
   return { ok: true, organizationId: orgId };
 }
+
+export async function updateOrganizationScheduleTimezoneAction(
+  organizationId: string,
+  scheduleTimezone: string,
+): Promise<{ ok: true } | { ok: false; error: string }> {
+  const trimmedId = organizationId.trim();
+  const tz = scheduleTimezone.trim();
+  if (!trimmedId) return { ok: false, error: "Organization is required" };
+  if (!tz || tz.length > 64) return { ok: false, error: "Choose a valid timezone" };
+
+  const { supabase, user } = await requireUser();
+  if (!supabase || !user) return { ok: false, error: "Not signed in" };
+
+  const { data: profile } = await supabase.from("profiles").select("app_role").eq("id", user.id).maybeSingle();
+  if (profile?.app_role !== "teacher") {
+    return { ok: false, error: "Only teachers can update organization settings." };
+  }
+
+  const { error } = await supabase.rpc("update_organization_schedule_timezone", {
+    p_organization_id: trimmedId,
+    p_schedule_timezone: tz,
+  });
+  if (error) return { ok: false, error: error.message };
+
+  revalidatePath("/");
+  revalidatePath("/onboarding");
+  revalidatePath("/organizations");
+  revalidatePath(`/organizations/${trimmedId}`);
+  revalidatePath("/schedule");
+  revalidatePath("/attendance");
+  return { ok: true };
+}

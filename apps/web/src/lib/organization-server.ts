@@ -2,8 +2,9 @@ import { cookies } from "next/headers";
 import type { AppRole } from "@/lib/auth";
 import { WKE_ACTIVE_ORG_COOKIE } from "@/lib/active-org-cookie";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
+import { resolveScheduleTimeZone } from "@/lib/schedule-timezone";
 
-export type OrgSummary = { id: string; name: string };
+export type OrgSummary = { id: string; name: string; scheduleTimezone: string };
 
 export type OrgWithRole = OrgSummary & { role: "owner" | "staff" | "client" };
 
@@ -45,12 +46,15 @@ export async function getOrganizationShellContext(params: {
 
   type MemberRow = {
     organization_id: string;
-    organizations: { id: string; name: string } | { id: string; name: string }[] | null;
+    organizations:
+      | { id: string; name: string; schedule_timezone: string | null }
+      | { id: string; name: string; schedule_timezone: string | null }[]
+      | null;
   };
 
   const { data: rows, error } = await supabase
     .from("organization_members")
-    .select("organization_id, organizations ( id, name )")
+    .select("organization_id, organizations ( id, name, schedule_timezone )")
     .eq("profile_id", params.userId);
 
   if (error || !rows?.length) {
@@ -65,8 +69,18 @@ export async function getOrganizationShellContext(params: {
     .map((r) => {
       const o = r.organizations;
       const org = Array.isArray(o) ? o[0] : o;
-      if (org?.id && org?.name) return { id: org.id, name: org.name };
-      return { id: r.organization_id, name: "Organization" };
+      if (org?.id && org?.name) {
+        return {
+          id: org.id,
+          name: org.name,
+          scheduleTimezone: resolveScheduleTimeZone(org.schedule_timezone),
+        };
+      }
+      return {
+        id: r.organization_id,
+        name: "Organization",
+        scheduleTimezone: resolveScheduleTimeZone(null),
+      };
     })
     .filter(Boolean);
 
@@ -104,7 +118,7 @@ export async function fetchTeacherOrganizationsWithRoles(userId: string): Promis
 
   const { data, error } = await supabase
     .from("organization_members")
-    .select("role, organization_id, organizations ( id, name )")
+    .select("role, organization_id, organizations ( id, name, schedule_timezone )")
     .eq("profile_id", userId);
 
   if (error || !data?.length) return [];
@@ -113,7 +127,10 @@ export async function fetchTeacherOrganizationsWithRoles(userId: string): Promis
   for (const row of data as {
     role: string;
     organization_id: string;
-    organizations: { id: string; name: string } | { id: string; name: string }[] | null;
+    organizations:
+      | { id: string; name: string; schedule_timezone: string | null }
+      | { id: string; name: string; schedule_timezone: string | null }[]
+      | null;
   }[]) {
     const r = row.role;
     if (r !== "owner" && r !== "staff" && r !== "client") continue;
@@ -121,7 +138,8 @@ export async function fetchTeacherOrganizationsWithRoles(userId: string): Promis
     const org = Array.isArray(o) ? o[0] : o;
     const name = org?.name ?? "Organization";
     const id = org?.id ?? row.organization_id;
-    out.push({ id, name, role: r });
+    const scheduleTimezone = resolveScheduleTimeZone(org?.schedule_timezone ?? null);
+    out.push({ id, name, scheduleTimezone, role: r });
   }
   return out;
 }
@@ -159,18 +177,24 @@ export async function fetchOrgMembershipRole(
 export async function fetchOrganizationByIdForMember(
   organizationId: string,
   memberUserId: string,
-): Promise<{ id: string; name: string; created_at: string } | null> {
+): Promise<{ id: string; name: string; created_at: string; scheduleTimezone: string } | null> {
   const role = await fetchOrgMembershipRole(memberUserId, organizationId);
   if (!role) return null;
   const supabase = await createServerSupabaseClient();
   if (!supabase) return null;
   const { data, error } = await supabase
     .from("organizations")
-    .select("id, name, created_at")
+    .select("id, name, created_at, schedule_timezone")
     .eq("id", organizationId)
     .maybeSingle();
   if (error || !data) return null;
-  return data as { id: string; name: string; created_at: string };
+  const row = data as { id: string; name: string; created_at: string; schedule_timezone: string | null };
+  return {
+    id: row.id,
+    name: row.name,
+    created_at: row.created_at,
+    scheduleTimezone: resolveScheduleTimeZone(row.schedule_timezone),
+  };
 }
 
 export async function getPendingJoinRequestsForOrg(organizationId: string): Promise<PendingJoinRequestRow[]> {

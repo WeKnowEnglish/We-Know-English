@@ -2,7 +2,12 @@ import { redirect } from "next/navigation";
 import { StudentsClient } from "@/app/students/students-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { fetchClassesForOrg, fetchEnrollmentsForOrg, fetchStudentsForOrg } from "@/lib/tracker-queries";
+import {
+  fetchClassesForOrg,
+  fetchEnrollmentsForOrg,
+  fetchStudentsForOrg,
+  resolveTeacherClassAccess,
+} from "@/lib/tracker-queries";
 
 export default async function StudentsManagementPage() {
   const { user, appRole } = await getSession();
@@ -16,9 +21,10 @@ export default async function StudentsManagementPage() {
     redirect("/onboarding");
   }
 
+  const access = await resolveTeacherClassAccess(user.id, orgId);
   const [students, classes, enrollments] = await Promise.all([
     fetchStudentsForOrg(orgId),
-    fetchClassesForOrg(orgId),
+    fetchClassesForOrg(orgId, access),
     fetchEnrollmentsForOrg(orgId),
   ]);
 

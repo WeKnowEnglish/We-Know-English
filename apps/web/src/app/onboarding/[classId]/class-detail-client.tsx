@@ -6,9 +6,11 @@ import { useRouter } from "next/navigation";
 import { addMonths, format } from "date-fns";
 import { PaintBucket } from "lucide-react";
 import {
+  addClassTeacherAction,
   addEnrollmentAction,
   deleteClassAction,
   removeAllEnrollmentsForClassAction,
+  removeClassTeacherAction,
   removeEnrollmentAction,
   upsertClassPayloadAction,
 } from "@/app/actions/tracker";
@@ -32,7 +34,11 @@ import {
 } from "@/lib/class-schedule";
 import { touchClassAccess } from "@/lib/classes-storage";
 import { formatClassGradesLong, formatClassGradesShort } from "@/lib/tracker-constants";
-import type { ClassAttendanceSlotRow } from "@/lib/tracker-queries";
+import type {
+  ClassAttendanceSlotRow,
+  ClassTeacherRosterEntry,
+  TeacherPickOption,
+} from "@/lib/tracker-queries";
 import type { ClassRoom, Student, StudentClassEnrollment, WeeklyRepeatRule } from "@/lib/tracker-types";
 import { cn } from "@/lib/utils";
 
@@ -55,20 +61,30 @@ const WEEKDAY_TOGGLE = [
 
 export type ClassDetailClientProps = {
   organizationId: string;
+  /** IANA zone for weekly times and session dates (from organization settings). */
+  scheduleTimeZone: string;
   classId: string;
   initialClassRoom: ClassRoom;
   initialStudents: Student[];
   initialEnrollments: StudentClassEnrollment[];
   initialAttendanceSlots: ClassAttendanceSlotRow[];
+  initialTeacherPanel: {
+    roster: ClassTeacherRosterEntry[];
+    addCandidates: TeacherPickOption[];
+    canManage: boolean;
+    viewerMayDeleteClass: boolean;
+  };
 };
 
 export function ClassDetailClient({
   organizationId,
+  scheduleTimeZone,
   classId,
   initialClassRoom,
   initialStudents,
   initialEnrollments,
   initialAttendanceSlots,
+  initialTeacherPanel,
 }: ClassDetailClientProps) {
   const router = useRouter();
   const [, startTransition] = useTransition();
@@ -88,6 +104,8 @@ export function ClassDetailClient({
   const [draftTime, setDraftTime] = useState("14:00");
   const [draftUntil, setDraftUntil] = useState("");
   const [draftFrom, setDraftFrom] = useState("");
+  const [teacherPanel, setTeacherPanel] = useState(initialTeacherPanel);
+  const [pickTeacherId, setPickTeacherId] = useState("");
 
   const rawClass = rawClassState.id === classId ? rawClassState : null;
   const classRoom = useMemo(() => (rawClass ? normalizeClassForRead(rawClass) : null), [rawClass]);
@@ -137,6 +155,10 @@ export function ClassDetailClient({
   }, [classId, initialClassRoom, initialStudents, initialEnrollments, initialAttendanceSlots]);
 
   useEffect(() => {
+    setTeacherPanel(initialTeacherPanel);
+  }, [initialTeacherPanel]);
+
+  useEffect(() => {
     setDraftWeekdays([]);
     setDraftTime("14:00");
     const today = format(new Date(), "yyyy-MM-dd");
@@ -165,10 +187,10 @@ export function ClassDetailClient({
   const attendanceReturnTo = `/onboarding/${classId}`;
 
   const startAttendanceSession = () => {
-    const occ = pickPrimaryAttendanceOccurrence(classRoom);
+    const occ = pickPrimaryAttendanceOccurrence(classRoom, { scheduleTimeZone });
     if (!occ) return;
     const key = buildOccurrenceKey(occ.classId, occ.slotId, occ.startsAt);
-    const sessionDate = sessionDateFromScheduleInstant(occ.startsAt);
+    const sessionDate = sessionDateFromScheduleInstant(occ.startsAt, scheduleTimeZone);
     router.push(
       buildAttendanceUrl({
         classId,
@@ -270,14 +292,14 @@ export function ClassDetailClient({
     const parsed = new Date(newSlotLocal);
     if (Number.isNaN(parsed.getTime())) return;
     const nextSlots = [...(classRoom.scheduleSlots ?? []), { id: makeSlotId(), startsAt: parsed.toISOString() }];
-    persistClassToStorage(withScheduleSlots(classRoom, nextSlots));
+    persistClassToStorage(withScheduleSlots(classRoom, nextSlots, scheduleTimeZone));
     setNewSlotLocal("");
   };
 
   const removeScheduleSlot = (slotId: string) => {
     if (!classRoom) return;
     const nextSlots = (classRoom.scheduleSlots ?? []).filter((slot) => slot.id !== slotId);
-    persistClassToStorage(withScheduleSlots(classRoom, nextSlots));
+    persistClassToStorage(withScheduleSlots(classRoom, nextSlots, scheduleTimeZone));
   };
 
   const toggleDraftWeekday = (day: number) => {
@@ -300,12 +322,12 @@ export function ClassDetailClient({
       repeatFrom: draftFrom.trim(),
       repeatUntil: draftUntil.trim(),
     };
-    persistClassToStorage(addWeeklyRuleToClass(rawClassState, rule));
+    persistClassToStorage(addWeeklyRuleToClass(rawClassState, rule, scheduleTimeZone));
     setDraftWeekdays([]);
   };
 
   const removeRecurringRule = (ruleId: string) => {
-    persistClassToStorage(removeWeeklyRuleFromClass(rawClassState, ruleId));
+    persistClassToStorage(removeWeeklyRuleFromClass(rawClassState, ruleId, scheduleTimeZone));
   };
 
   const deleteClass = () => {
@@ -335,9 +357,11 @@ export function ClassDetailClient({
         </div>
         <div className="flex items-center gap-2">
           <Badge variant="secondary">Join code: {classRoom.joinCode}</Badge>
-          <Button type="button" size="sm" variant="destructive" onClick={deleteClass}>
-            Delete class
-          </Button>
+          {teacherPanel.viewerMayDeleteClass ? (
+            <Button type="button" size="sm" variant="destructive" onClick={deleteClass}>
+              Delete class
+            </Button>
+          ) : null}
         </div>
       </div>
 
@@ -395,6 +419,102 @@ export function ClassDetailClient({
           </Card>
         </div>
       </section>
+
+      <Card className="w-full max-w-4xl">
+        <CardHeader>
+          <CardTitle className="text-base">Teachers</CardTitle>
+          <CardDescription>
+            Lead instructor and co-teachers from your organization. Co-teachers see this class in their schedule and
+            attendance lists. Only the organization owner or the lead instructor can add or remove co-teachers.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-3">
+          <ul className="space-y-2 text-sm">
+            {teacherPanel.roster.map((row) => (
+              <li
+                key={row.profileId}
+                className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-border bg-muted/20 px-3 py-2"
+              >
+                <span>
+                  {row.fullName}
+                  {row.isPrimary ? (
+                    <Badge variant="secondary" className="ml-2">
+                      Lead
+                    </Badge>
+                  ) : null}
+                </span>
+                {teacherPanel.canManage && !row.isPrimary ? (
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="outline"
+                    onClick={() => {
+                      startTransition(async () => {
+                        const res = await removeClassTeacherAction(organizationId, classId, row.profileId);
+                        if (!res.ok) {
+                          window.alert(res.error);
+                          return;
+                        }
+                        router.refresh();
+                      });
+                    }}
+                  >
+                    Remove
+                  </Button>
+                ) : null}
+              </li>
+            ))}
+          </ul>
+          {teacherPanel.canManage && teacherPanel.addCandidates.length > 0 ? (
+            <div className="flex flex-wrap items-end gap-2">
+              <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
+                <label htmlFor="add-co-teacher" className="text-xs font-medium text-muted-foreground">
+                  Add co-teacher
+                </label>
+                <select
+                  id="add-co-teacher"
+                  className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                  value={pickTeacherId}
+                  onChange={(e) => setPickTeacherId(e.target.value)}
+                >
+                  <option value="">Select a teacher…</option>
+                  {teacherPanel.addCandidates.map((opt) => (
+                    <option key={opt.profileId} value={opt.profileId}>
+                      {opt.fullName}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <Button
+                type="button"
+                size="sm"
+                disabled={!pickTeacherId}
+                onClick={() => {
+                  const pid = pickTeacherId;
+                  if (!pid) return;
+                  startTransition(async () => {
+                    const res = await addClassTeacherAction(organizationId, classId, pid);
+                    if (!res.ok) {
+                      window.alert(res.error);
+                      return;
+                    }
+                    setPickTeacherId("");
+                    router.refresh();
+                  });
+                }}
+              >
+                Add
+              </Button>
+            </div>
+          ) : null}
+          {!teacherPanel.canManage ? (
+            <p className="text-xs text-muted-foreground">Ask the lead instructor or owner to assign co-teachers.</p>
+          ) : null}
+          {teacherPanel.canManage && teacherPanel.addCandidates.length === 0 ? (
+            <p className="text-xs text-muted-foreground">All organization teachers are already on this class.</p>
+          ) : null}
+        </CardContent>
+      </Card>
 
       <div className="grid w-full max-w-4xl gap-4 md:grid-cols-2">
         <Card className="w-full border-emerald-200 bg-emerald-50/70 dark:border-emerald-900 dark:bg-emerald-950/20">

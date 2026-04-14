@@ -62,10 +62,15 @@ export function ClassesClient({ organizationId, initialClasses }: ClassesClientP
 
   const persistOrder = () => {
     startTransition(async () => {
-      await updateClassesOrderAction(
+      const res = await updateClassesOrderAction(
         organizationId,
         items.map((item) => item.id),
       );
+      if (!res.ok) {
+        window.alert(res.error);
+        router.refresh();
+        return;
+      }
       router.refresh();
     });
   };
