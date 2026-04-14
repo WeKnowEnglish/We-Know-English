@@ -2,6 +2,7 @@ import { Suspense } from "react";
 import { redirect } from "next/navigation";
 import { AttendanceClient } from "@/app/attendance/attendance-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import { getSession } from "@/lib/session";
 import { isSessionUuid } from "@/lib/attendance-utils";
 import {
@@ -38,15 +39,17 @@ export default async function AttendancePage({
   }
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const [classes, students, enrollments, initialSessionBundle, priorityClasses] = await Promise.all([
-    fetchClassesForOrg(orgId, access),
-    fetchStudentsForOrg(orgId),
-    fetchEnrollmentsForOrg(orgId),
-    sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
-      ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
-      : Promise.resolve(null),
-    fetchAttendancePriorityClasses(orgId, access),
-  ]);
+  const [classes, students, enrollments, initialSessionBundle, priorityClasses, scheduleTimeZone] =
+    await Promise.all([
+      fetchClassesForOrg(orgId, access),
+      fetchStudentsForOrg(orgId),
+      fetchEnrollmentsForOrg(orgId),
+      sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
+        ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
+        : Promise.resolve(null),
+      fetchAttendancePriorityClasses(orgId, access),
+      getScheduleTimezoneForOrganization(orgId),
+    ]);
 
   return (
     <Suspense
@@ -58,6 +61,7 @@ export default async function AttendancePage({
     >
       <AttendanceClient
         organizationId={orgId}
+        scheduleTimeZone={scheduleTimeZone}
         initialClasses={classes}
         initialStudents={students}
         initialEnrollments={enrollments}

@@ -2,6 +2,7 @@ import { redirect } from "next/navigation";
 import { ScheduleClient } from "@/app/schedule/schedule-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import { fetchClassesForOrg, resolveTeacherClassAccess } from "@/lib/tracker-queries";
 
 export default async function SchedulePage() {
@@ -17,6 +18,9 @@ export default async function SchedulePage() {
   }
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const classes = await fetchClassesForOrg(orgId, access);
-  return <ScheduleClient organizationId={orgId} initialClasses={classes} />;
+  const [classes, scheduleTimeZone] = await Promise.all([
+    fetchClassesForOrg(orgId, access),
+    getScheduleTimezoneForOrganization(orgId),
+  ]);
+  return <ScheduleClient organizationId={orgId} scheduleTimeZone={scheduleTimeZone} initialClasses={classes} />;
 }

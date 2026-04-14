@@ -1,5 +1,13 @@
-import { addDays, addMonths, addYears, eachDayOfInterval, format, subDays } from "date-fns";
+import { addDays, addMonths, addYears, format, subDays } from "date-fns";
 import type { ClassRoom, ClassScheduleSlot, WeeklyRepeatRule } from "@/lib/tracker-types";
+import {
+  calendarYmdInScheduleZone,
+  eachYmdBetweenInclusive,
+  endOfCalendarDayInZone,
+  getEnvScheduleTimeZone,
+  utcWeekdayFromYmd,
+  zonedWallClockToUtcMillis,
+} from "@/lib/schedule-timezone";
 
 export function makeSlotId() {
   return `slot_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
@@ -28,28 +36,18 @@ function readOneOffStarts(classRoom: ClassRoom): string[] {
   return [];
 }
 
-function localDateKey(d: Date): string {
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-}
-
 /**
- * Calendar YYYY-MM-DD in the runtime's local timezone for a schedule instant.
- * Use this (not `toISOString().slice(0, 10)`) for `session_date` / deep links so evening classes
- * stay on the correct local class day instead of shifting to the next UTC day.
+ * Calendar YYYY-MM-DD in the organization's schedule timezone (or env fallback).
+ * Use this (not `toISOString().slice(0, 10)` or runtime local getters) for `session_date` / deep links
+ * so evening classes stay on the correct class day on servers in UTC (e.g. Vercel).
  */
-export function sessionDateFromScheduleInstant(startsAt: string | Date): string {
+export function sessionDateFromScheduleInstant(
+  startsAt: string | Date,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): string {
   const d = typeof startsAt === "string" ? new Date(startsAt) : startsAt;
   if (Number.isNaN(+d)) return "";
-  return localDateKey(d);
-}
-
-/** Wall-clock time on a given calendar day in the local timezone. */
-export function startsAtForDayAndTimeLocal(day: Date, timeLocal: string): number {
-  const m = /^(\d{1,2}):(\d{2})$/.exec(timeLocal.trim());
-  if (!m) return Number.NaN;
-  const h = Math.min(23, parseInt(m[1], 10));
-  const min = Math.min(59, parseInt(m[2], 10));
-  return +new Date(day.getFullYear(), day.getMonth(), day.getDate(), h, min, 0, 0);
+  return calendarYmdInScheduleZone(d, scheduleTimeZone);
 }
 
 export function isValidWeeklyTimeLocal(value: string): boolean {
@@ -108,35 +106,33 @@ export function expandWeeklyRuleToTimestamps(
   rule: WeeklyRepeatRule,
   rangeStart: Date,
   rangeEnd: Date,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
 ): number[] {
+  const tz = scheduleTimeZone;
   if (!validWeeklyRule(rule)) return [];
   const daysSet = new Set(rule.weekdays.filter((d) => d >= 0 && d <= 6));
   if (daysSet.size === 0) return [];
-  const [y, m, d] = rule.repeatUntil.split("-").map(Number);
-  const untilEnd = new Date(y, m - 1, d, 23, 59, 59, 999);
-  const end = new Date(Math.min(rangeEnd.getTime(), untilEnd.getTime()));
-  const rangeDayStart = new Date(
-    rangeStart.getFullYear(),
-    rangeStart.getMonth(),
-    rangeStart.getDate(),
-    0,
-    0,
-    0,
-    0,
-  );
-  let start = rangeDayStart;
+
+  let startYmd = calendarYmdInScheduleZone(rangeStart, tz);
+  let endYmd = calendarYmdInScheduleZone(rangeEnd, tz);
+  const until = rule.repeatUntil.trim();
+  if (endYmd > until) endYmd = until;
+
   const fromRaw = rule.repeatFrom?.trim();
-  if (fromRaw && isValidRepeatUntilDate(fromRaw)) {
-    const [yf, mf, df] = fromRaw.split("-").map(Number);
-    const fromStart = new Date(yf, mf - 1, df, 0, 0, 0, 0);
-    if (fromStart > start) start = fromStart;
+  if (fromRaw && isValidRepeatUntilDate(fromRaw) && fromRaw > startYmd) {
+    startYmd = fromRaw;
   }
-  if (end < start) return [];
-  return eachDayOfInterval({ start, end })
-    .filter((day) => daysSet.has(day.getDay()))
-    .filter((day) => localDateKey(day) <= rule.repeatUntil)
-    .map((day) => startsAtForDayAndTimeLocal(day, rule.timeLocal))
-    .filter((t) => !Number.isNaN(t));
+
+  if (startYmd > endYmd) return [];
+
+  const stamps: number[] = [];
+  for (const ymd of eachYmdBetweenInclusive(startYmd, endYmd)) {
+    if (ymd > until) break;
+    if (!daysSet.has(utcWeekdayFromYmd(ymd))) continue;
+    const ms = zonedWallClockToUtcMillis(ymd, rule.timeLocal, tz);
+    if (!Number.isNaN(ms)) stamps.push(ms);
+  }
+  return stamps;
 }
 
 /** If `scheduleSlots` was never stored, surface legacy `nextSessionAt` as one slot. Explicit `[]` stays empty. */
@@ -166,13 +162,16 @@ export function classHasDefinedSchedule(classRoom: ClassRoom): boolean {
   return false;
 }
 
-function finalizeRoom(c: ClassRoom): ClassRoom {
+function finalizeRoom(c: ClassRoom, scheduleTimeZone: string): ClassRoom {
   const updatedAt = new Date().toISOString();
   const next = { ...c, updatedAt };
-  return { ...next, nextSessionAt: recomputeNextSessionAt(next) };
+  return { ...next, nextSessionAt: recomputeNextSessionAt(next, scheduleTimeZone) };
 }
 
-export function recomputeNextSessionAt(classRoom: ClassRoom): string {
+export function recomputeNextSessionAt(
+  classRoom: ClassRoom,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): string {
   const oneOffMs = readOneOffStarts(classRoom)
     .map((iso) => +new Date(iso))
     .filter((t) => !Number.isNaN(t));
@@ -180,13 +179,16 @@ export function recomputeNextSessionAt(classRoom: ClassRoom): string {
   const nowMs = now.getTime();
   const cap = addMonths(now, 18);
   const weeklyMs: number[] = [];
+  const tz = scheduleTimeZone;
   for (const rule of getWeeklyRulesFromClass(classRoom)) {
     if (!isValidRepeatUntilDate(rule.repeatUntil)) continue;
-    const [y, m, d] = rule.repeatUntil.split("-").map(Number);
-    const untilEnd = new Date(y, m - 1, d, 23, 59, 59, 999);
-    const end = untilEnd < cap ? untilEnd : cap;
+    const ruleUntilYmd = rule.repeatUntil.trim();
+    const capYmd = calendarYmdInScheduleZone(cap, tz);
+    const lastYmd = ruleUntilYmd < capYmd ? ruleUntilYmd : capYmd;
+    const untilEnd = endOfCalendarDayInZone(lastYmd, tz);
+    const end = new Date(Math.min(untilEnd.getTime(), cap.getTime()));
     if (end < now) continue;
-    weeklyMs.push(...expandWeeklyRuleToTimestamps(rule, now, end));
+    weeklyMs.push(...expandWeeklyRuleToTimestamps(rule, now, end, tz));
   }
   const times = [...oneOffMs, ...weeklyMs];
   if (times.length === 0) {
@@ -199,13 +201,21 @@ export function recomputeNextSessionAt(classRoom: ClassRoom): string {
   return new Date(Math.min(...times)).toISOString();
 }
 
-export function withScheduleSlots(classRoom: ClassRoom, slots: ClassScheduleSlot[]): ClassRoom {
+export function withScheduleSlots(
+  classRoom: ClassRoom,
+  slots: ClassScheduleSlot[],
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): ClassRoom {
   const updatedAt = new Date().toISOString();
   const next = { ...classRoom, scheduleSlots: slots, updatedAt };
-  return { ...next, nextSessionAt: recomputeNextSessionAt(next) };
+  return finalizeRoom(next, scheduleTimeZone);
 }
 
-export function addWeeklyRuleToClass(classRoom: ClassRoom, rule: WeeklyRepeatRule): ClassRoom {
+export function addWeeklyRuleToClass(
+  classRoom: ClassRoom,
+  rule: WeeklyRepeatRule,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): ClassRoom {
   const fromTrim = rule.repeatFrom?.trim();
   const normalizedRule: WeeklyRepeatRule = {
     ...rule,
@@ -224,29 +234,42 @@ export function addWeeklyRuleToClass(classRoom: ClassRoom, rule: WeeklyRepeatRul
   } else {
     nextRules = [normalizedRule];
   }
-  return finalizeRoom({
-    ...classRoom,
-    weeklyRepeatRules: nextRules,
-    weeklyRepeat: undefined,
-  });
+  return finalizeRoom(
+    {
+      ...classRoom,
+      weeklyRepeatRules: nextRules,
+      weeklyRepeat: undefined,
+    },
+    scheduleTimeZone,
+  );
 }
 
-export function removeWeeklyRuleFromClass(classRoom: ClassRoom, ruleId: string): ClassRoom {
+export function removeWeeklyRuleFromClass(
+  classRoom: ClassRoom,
+  ruleId: string,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): ClassRoom {
   const hasExplicit = Array.isArray(classRoom.weeklyRepeatRules) && classRoom.weeklyRepeatRules.length > 0;
   if (hasExplicit) {
     const next = (classRoom.weeklyRepeatRules ?? []).filter((r) => r.id !== ruleId);
-    return finalizeRoom({
-      ...classRoom,
-      weeklyRepeatRules: next.length ? next : undefined,
-      weeklyRepeat: undefined,
-    });
+    return finalizeRoom(
+      {
+        ...classRoom,
+        weeklyRepeatRules: next.length ? next : undefined,
+        weeklyRepeat: undefined,
+      },
+      scheduleTimeZone,
+    );
   }
   if (classRoom.weeklyRepeat && ruleId.startsWith("wrr_legacy_")) {
-    return finalizeRoom({
-      ...classRoom,
-      weeklyRepeat: undefined,
-      weeklyRepeatRules: undefined,
-    });
+    return finalizeRoom(
+      {
+        ...classRoom,
+        weeklyRepeat: undefined,
+        weeklyRepeatRules: undefined,
+      },
+      scheduleTimeZone,
+    );
   }
   return classRoom;
 }
@@ -258,7 +281,13 @@ export type ScheduleEvent = {
   startsAt: string;
 };
 
-export function getScheduleEvents(classes: ClassRoom[], rangeStart: Date, rangeEnd: Date): ScheduleEvent[] {
+export function getScheduleEvents(
+  classes: ClassRoom[],
+  rangeStart: Date,
+  rangeEnd: Date,
+  scheduleTimeZone: string = getEnvScheduleTimeZone(),
+): ScheduleEvent[] {
+  const tz = scheduleTimeZone;
   const events: ScheduleEvent[] = [];
   for (const c of classes) {
     const normalized = normalizeClassForRead(c);
@@ -272,16 +301,14 @@ export function getScheduleEvents(classes: ClassRoom[], rangeStart: Date, rangeE
       });
     }
     for (const rule of getWeeklyRulesFromClass(c)) {
-      const stamps = expandWeeklyRuleToTimestamps(rule, rangeStart, rangeEnd);
+      const stamps = expandWeeklyRuleToTimestamps(rule, rangeStart, rangeEnd, tz);
       for (const ms of stamps) {
         const d = new Date(ms);
-        const y = d.getFullYear();
-        const mo = String(d.getMonth() + 1).padStart(2, "0");
-        const da = String(d.getDate()).padStart(2, "0");
+        const ymd = calendarYmdInScheduleZone(d, tz);
         events.push({
           classId: c.id,
           className: c.name,
-          slotId: `weekly_${c.id}_${rule.id}_${y}-${mo}-${da}`,
+          slotId: `weekly_${c.id}_${rule.id}_${ymd}`,
           startsAt: d.toISOString(),
         });
       }
@@ -334,10 +361,15 @@ export function embeddedCalendarDayFromOccurrenceKey(occurrenceKey: string | nul
 /**
  * Pick the best schedule row for "take attendance now": next upcoming in-window, else most recent past in range.
  */
-export function pickPrimaryAttendanceOccurrence(classRoom: ClassRoom, now: Date = new Date()): ScheduleEvent | null {
+export function pickPrimaryAttendanceOccurrence(
+  classRoom: ClassRoom,
+  options?: { now?: Date; scheduleTimeZone?: string },
+): ScheduleEvent | null {
+  const now = options?.now ?? new Date();
+  const tz = options?.scheduleTimeZone ?? getEnvScheduleTimeZone();
   const start = subDays(now, 7);
   const end = addDays(now, 21);
-  const events = getScheduleEvents([classRoom], start, end).filter((e) => e.classId === classRoom.id);
+  const events = getScheduleEvents([classRoom], start, end, tz).filter((e) => e.classId === classRoom.id);
   if (events.length === 0) return null;
   const nowMs = now.getTime();
   const upcoming = events

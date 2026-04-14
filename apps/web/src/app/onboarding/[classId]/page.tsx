@@ -2,6 +2,7 @@ import { notFound, redirect } from "next/navigation";
 import { ClassDetailClient } from "./class-detail-client";
 import { fetchOrgMembershipRole, getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import {
   fetchAttendanceSlotsForClass,
   fetchClassById,
@@ -39,16 +40,18 @@ export default async function ClassDetailPage({ params }: { params: Promise<{ cl
     notFound();
   }
 
-  const [students, enrollments, attendanceSlots, teacherPanel] = await Promise.all([
+  const [students, enrollments, attendanceSlots, teacherPanel, scheduleTimeZone] = await Promise.all([
     fetchStudentsForOrg(orgId),
     fetchEnrollmentsForOrg(orgId),
     fetchAttendanceSlotsForClass(orgId, classRoom),
     fetchClassTeacherPanelData(orgId, classId, { userId: user.id, orgRole }),
+    getScheduleTimezoneForOrganization(orgId),
   ]);
 
   return (
     <ClassDetailClient
       organizationId={orgId}
+      scheduleTimeZone={scheduleTimeZone}
       classId={classId}
       initialClassRoom={classRoom}
       initialStudents={students}

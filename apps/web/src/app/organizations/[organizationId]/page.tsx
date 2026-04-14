@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { OrgDetailPendingClient } from "@/app/organizations/[organizationId]/org-detail-client";
+import { OrgScheduleTimezoneForm } from "@/app/organizations/[organizationId]/org-schedule-timezone-form";
 import {
   fetchOrgMembershipRole,
   fetchOrganizationByIdForMember,
@@ -46,6 +47,13 @@ export default async function OrganizationDetailPage({ params }: PageProps) {
           Your role: <strong className="capitalize text-foreground">{role}</strong>
         </p>
       </div>
+
+      {(role === "owner" || role === "staff") && (
+        <section className="rounded-xl border border-border bg-card p-4">
+          <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Schedule timezone</h2>
+          <OrgScheduleTimezoneForm organizationId={organizationId} initialTimezone={org.scheduleTimezone} />
+        </section>
+      )}
 
       <section className="rounded-xl border border-border bg-card p-4">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Teacher join requests</h2>

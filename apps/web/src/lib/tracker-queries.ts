@@ -1,5 +1,6 @@
 import { addDays, endOfDay, format, subDays } from "date-fns";
 import { fetchOrgMembershipRole } from "@/lib/organization-server";
+import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
 import {
   buildOccurrenceKey,
@@ -919,10 +920,11 @@ export async function fetchMissedAttendanceOccurrences(
   const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
   if (teachable.length === 0) return [];
 
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
   const now = new Date();
   const rangeStart = subDays(now, 30);
   const rangeEnd = addDays(now, 1);
-  const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd, tz);
   const past = events.filter((e) => +new Date(e.startsAt) < +now);
 
   const supabase = await createServerSupabaseClient();
@@ -964,7 +966,7 @@ export async function fetchMissedAttendanceOccurrences(
       classId: e.classId,
       className: e.className,
       startsAt: e.startsAt,
-      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt, tz),
     });
   }
 
@@ -1017,7 +1019,7 @@ export async function fetchMissedAttendanceOccurrences(
         classId: row.class_id,
         className,
         startsAt: parsed.startsAt.toISOString(),
-        sessionDate: sessionDateFromScheduleInstant(parsed.startsAt),
+        sessionDate: sessionDateFromScheduleInstant(parsed.startsAt, tz),
       });
     }
   }
@@ -1079,11 +1081,12 @@ export async function fetchAttendancePriorityClasses(
   const teachable = classes.filter((c) => classIdsWithStudents.has(c.id));
   if (teachable.length === 0) return [];
 
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
   const now = new Date();
   const nowMs = +now;
   const rangeStart = subDays(now, 5);
   const rangeEnd = addDays(now, 2);
-  const events = getScheduleEvents(teachable, rangeStart, rangeEnd);
+  const events = getScheduleEvents(teachable, rangeStart, rangeEnd, tz);
   if (events.length === 0) return [];
 
   const keys = [...new Set(events.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
@@ -1137,7 +1140,7 @@ export async function fetchAttendancePriorityClasses(
       className: event.className,
       occurrenceKey: buildOccurrenceKey(event.classId, event.slotId, event.startsAt),
       startsAt: event.startsAt,
-      sessionDate: sessionDateFromScheduleInstant(event.startsAt),
+      sessionDate: sessionDateFromScheduleInstant(event.startsAt, tz),
       kind,
     });
   }
@@ -1201,13 +1204,14 @@ export async function fetchAttendanceSlotsForClass(
   organizationId: string,
   classRoom: ClassRoom,
 ): Promise<ClassAttendanceSlotRow[]> {
+  const tz = await getScheduleTimezoneForOrganization(organizationId);
   const now = new Date();
   const rangeStart = subDays(now, 21);
   /** Expand through today only; then keep slots whose start is already in the past (no upcoming / future weeks). */
   const rangeEnd = endOfDay(now);
   const rangeStartMs = +rangeStart;
   const nowMs = +now;
-  const events = getScheduleEvents([classRoom], rangeStart, rangeEnd).filter((e) => {
+  const events = getScheduleEvents([classRoom], rangeStart, rangeEnd, tz).filter((e) => {
     const t = +new Date(e.startsAt);
     return !Number.isNaN(t) && t >= rangeStartMs && t < nowMs;
   });
@@ -1248,7 +1252,7 @@ export async function fetchAttendanceSlotsForClass(
     return {
       occurrenceKey: k,
       startsAt: e.startsAt,
-      sessionDate: sessionDateFromScheduleInstant(e.startsAt),
+      sessionDate: sessionDateFromScheduleInstant(e.startsAt, tz),
       sessionId: s?.id ?? null,
       attendanceFinalized: s?.attendance_finalized ?? false,
     };

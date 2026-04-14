@@ -28,15 +28,17 @@ const WEEK_OPTIONS = { weekStartsOn: 0 as const };
 
 export type ScheduleClientProps = {
   organizationId: string;
+  scheduleTimeZone: string;
   initialClasses: ClassRoom[];
 };
 
 function attendanceHrefForScheduleEvent(
   ev: { classId: string; slotId: string; startsAt: string },
   occurrenceSessionMap: Record<string, { sessionId: string; attendanceFinalized: boolean }>,
+  scheduleTimeZone: string,
 ): string {
   const occurrenceKey = buildOccurrenceKey(ev.classId, ev.slotId, ev.startsAt);
-  const sessionDate = sessionDateFromScheduleInstant(ev.startsAt);
+  const sessionDate = sessionDateFromScheduleInstant(ev.startsAt, scheduleTimeZone);
   const hit = occurrenceSessionMap[occurrenceKey];
   return buildAttendanceUrl({
     classId: ev.classId,
@@ -47,7 +49,7 @@ function attendanceHrefForScheduleEvent(
   });
 }
 
-export function ScheduleClient({ organizationId, initialClasses }: ScheduleClientProps) {
+export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasses }: ScheduleClientProps) {
   const router = useRouter();
   const [cursor, setCursor] = useState(() => new Date());
   const [classes, setClasses] = useState<ClassRoom[]>(initialClasses);
@@ -74,8 +76,8 @@ export function ScheduleClient({ organizationId, initialClasses }: ScheduleClien
   const rangeEnd = useMemo(() => endOfWeek(endOfMonth(addMonths(cursor, 1)), WEEK_OPTIONS), [cursor]);
 
   const events = useMemo(
-    () => getScheduleEvents(classes, rangeStart, rangeEnd),
-    [classes, rangeStart, rangeEnd],
+    () => getScheduleEvents(classes, rangeStart, rangeEnd, scheduleTimeZone),
+    [classes, rangeStart, rangeEnd, scheduleTimeZone],
   );
 
   const [occurrenceSessionMap, setOccurrenceSessionMap] = useState<
@@ -197,7 +199,7 @@ export function ScheduleClient({ organizationId, initialClasses }: ScheduleClien
                       return (
                         <Link
                           key={occKey}
-                          href={attendanceHrefForScheduleEvent(ev, occurrenceSessionMap)}
+                          href={attendanceHrefForScheduleEvent(ev, occurrenceSessionMap, scheduleTimeZone)}
                           title={
                             finalized === true
                               ? `${ev.className} — view finalized attendance`

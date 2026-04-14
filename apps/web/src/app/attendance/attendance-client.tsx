@@ -75,6 +75,7 @@ type SaveUiState = "idle" | "saving" | "saved" | "error";
 
 export type AttendanceClientProps = {
   organizationId: string;
+  scheduleTimeZone: string;
   initialClasses: ClassRoom[];
   initialStudents: Student[];
   initialEnrollments: StudentClassEnrollment[];
@@ -90,6 +91,7 @@ export type AttendanceClientProps = {
 
 export function AttendanceClient({
   organizationId,
+  scheduleTimeZone,
   initialClasses,
   initialStudents,
   initialEnrollments,
@@ -181,14 +183,16 @@ export function AttendanceClient({
       setOccurrenceKey(initialSessionBundle.occurrenceKey ?? "");
       const parsedOcc = parseOccurrenceKey(initialSessionBundle.occurrenceKey ?? "");
       setSessionDate(
-        parsedOcc ? sessionDateFromScheduleInstant(parsedOcc.startsAt) : initialSessionBundle.sessionDate,
+        parsedOcc
+          ? sessionDateFromScheduleInstant(parsedOcc.startsAt, scheduleTimeZone)
+          : initialSessionBundle.sessionDate,
       );
       const rosterIds = enrollments
         .filter((e) => e.classId === initialSessionBundle.classId)
         .map((e) => e.studentId);
       lastPersistedSnapshotRef.current = rosterAttendanceSnapshot(merged, rosterIds);
     }
-  }, [initialSessionBundle, sessionIdFromQuery, mergeAttendanceWithRoster, enrollments]);
+  }, [initialSessionBundle, sessionIdFromQuery, mergeAttendanceWithRoster, enrollments, scheduleTimeZone]);
 
   useEffect(() => {
     if (classIdFromQuery) setActiveClassId(classIdFromQuery);
@@ -427,7 +431,7 @@ export function AttendanceClient({
     }
 
     const classRoom = classes.find((c) => c.id === classId);
-    const occ = classRoom ? pickPrimaryAttendanceOccurrence(classRoom) : null;
+    const occ = classRoom ? pickPrimaryAttendanceOccurrence(classRoom, { scheduleTimeZone }) : null;
     if (!classRoom || !occ) {
       const defaults = createDefaultAttendanceForClass(classId);
       const sd = new Date().toISOString().slice(0, 10);
@@ -463,7 +467,7 @@ export function AttendanceClient({
       return;
     }
     const key = buildOccurrenceKey(occ.classId, occ.slotId, occ.startsAt);
-    const sd = sessionDateFromScheduleInstant(occ.startsAt);
+    const sd = sessionDateFromScheduleInstant(occ.startsAt, scheduleTimeZone);
     const defaults = createDefaultAttendanceForClass(classId);
     setActiveClassId(classId);
     setOccurrenceKey(key);

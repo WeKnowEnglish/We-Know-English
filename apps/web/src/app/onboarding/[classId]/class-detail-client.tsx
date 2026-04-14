@@ -61,6 +61,8 @@ const WEEKDAY_TOGGLE = [
 
 export type ClassDetailClientProps = {
   organizationId: string;
+  /** IANA zone for weekly times and session dates (from organization settings). */
+  scheduleTimeZone: string;
   classId: string;
   initialClassRoom: ClassRoom;
   initialStudents: Student[];
@@ -76,6 +78,7 @@ export type ClassDetailClientProps = {
 
 export function ClassDetailClient({
   organizationId,
+  scheduleTimeZone,
   classId,
   initialClassRoom,
   initialStudents,
@@ -184,10 +187,10 @@ export function ClassDetailClient({
   const attendanceReturnTo = `/onboarding/${classId}`;
 
   const startAttendanceSession = () => {
-    const occ = pickPrimaryAttendanceOccurrence(classRoom);
+    const occ = pickPrimaryAttendanceOccurrence(classRoom, { scheduleTimeZone });
     if (!occ) return;
     const key = buildOccurrenceKey(occ.classId, occ.slotId, occ.startsAt);
-    const sessionDate = sessionDateFromScheduleInstant(occ.startsAt);
+    const sessionDate = sessionDateFromScheduleInstant(occ.startsAt, scheduleTimeZone);
     router.push(
       buildAttendanceUrl({
         classId,
@@ -289,14 +292,14 @@ export function ClassDetailClient({
     const parsed = new Date(newSlotLocal);
     if (Number.isNaN(parsed.getTime())) return;
     const nextSlots = [...(classRoom.scheduleSlots ?? []), { id: makeSlotId(), startsAt: parsed.toISOString() }];
-    persistClassToStorage(withScheduleSlots(classRoom, nextSlots));
+    persistClassToStorage(withScheduleSlots(classRoom, nextSlots, scheduleTimeZone));
     setNewSlotLocal("");
   };
 
   const removeScheduleSlot = (slotId: string) => {
     if (!classRoom) return;
     const nextSlots = (classRoom.scheduleSlots ?? []).filter((slot) => slot.id !== slotId);
-    persistClassToStorage(withScheduleSlots(classRoom, nextSlots));
+    persistClassToStorage(withScheduleSlots(classRoom, nextSlots, scheduleTimeZone));
   };
 
   const toggleDraftWeekday = (day: number) => {
@@ -319,12 +322,12 @@ export function ClassDetailClient({
       repeatFrom: draftFrom.trim(),
       repeatUntil: draftUntil.trim(),
     };
-    persistClassToStorage(addWeeklyRuleToClass(rawClassState, rule));
+    persistClassToStorage(addWeeklyRuleToClass(rawClassState, rule, scheduleTimeZone));
     setDraftWeekdays([]);
   };
 
   const removeRecurringRule = (ruleId: string) => {
-    persistClassToStorage(removeWeeklyRuleFromClass(rawClassState, ruleId));
+    persistClassToStorage(removeWeeklyRuleFromClass(rawClassState, ruleId, scheduleTimeZone));
   };
 
   const deleteClass = () => {
