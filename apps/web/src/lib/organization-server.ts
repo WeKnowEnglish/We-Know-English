@@ -16,6 +16,15 @@ export type PendingJoinRequestRow = {
   created_at: string;
 };
 
+export type OrganizationMemberDirectoryRow = {
+  profileId: string;
+  fullName: string;
+  email: string;
+  orgRole: "owner" | "staff" | "client";
+  appRole: "teacher" | "student" | null;
+  joinedAt: string;
+};
+
 export type OrganizationShellContext = {
   organizations: OrgSummary[];
   activeOrganizationId: string | null;
@@ -217,5 +226,47 @@ export async function getPendingJoinRequestsForOrg(organizationId: string): Prom
       created_at: typeof raw.created_at === "string" ? raw.created_at : String(raw.created_at ?? ""),
     });
   }
+  return rows;
+}
+
+export async function fetchOrganizationMembersForOrg(organizationId: string): Promise<OrganizationMemberDirectoryRow[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+  const { data, error } = await supabase
+    .from("organization_members")
+    .select("profile_id, role, created_at, profiles(full_name, app_role)")
+    .eq("organization_id", organizationId);
+  if (error || !data) return [];
+
+  const rows: OrganizationMemberDirectoryRow[] = [];
+  for (const raw of data as {
+    profile_id: string;
+    role: string;
+    created_at: string;
+    profiles:
+      | { full_name: string | null; app_role: string | null }
+      | { full_name: string | null; app_role: string | null }[]
+      | null;
+  }[]) {
+    if (raw.role !== "owner" && raw.role !== "staff" && raw.role !== "client") continue;
+    const pRaw = raw.profiles;
+    const p = pRaw && !Array.isArray(pRaw) ? pRaw : Array.isArray(pRaw) ? pRaw[0] : null;
+    const appRole = p?.app_role === "teacher" || p?.app_role === "student" ? p.app_role : null;
+    rows.push({
+      profileId: raw.profile_id,
+      fullName: p?.full_name?.trim() || "Unknown member",
+      email: "",
+      orgRole: raw.role,
+      appRole,
+      joinedAt: raw.created_at,
+    });
+  }
+
+  const roleOrder = { owner: 0, staff: 1, client: 2 } as const;
+  rows.sort((a, b) => {
+    const roleDiff = roleOrder[a.orgRole] - roleOrder[b.orgRole];
+    if (roleDiff !== 0) return roleDiff;
+    return a.fullName.localeCompare(b.fullName);
+  });
   return rows;
 }
