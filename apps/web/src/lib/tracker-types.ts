@@ -71,3 +71,31 @@ export type FeedEntry = {
   mediaUrl: string | null;
   createdAt: string;
 };
+
+export type ClassFeedPostStatus = "draft" | "published";
+export type ClassFeedPostVisibility = "internal" | "parent_visible";
+
+export type ClassFeedPost = {
+  id: string;
+  organizationId: string;
+  classId: string;
+  title: string | null;
+  body: string;
+  status: ClassFeedPostStatus;
+  visibility: ClassFeedPostVisibility;
+  pinned: boolean;
+  archivedAt: string | null;
+  publishedAt: string | null;
+  createdAt: string;
+  updatedAt: string;
+  createdBy: string;
+  publishedBy: string | null;
+  studentIds: string[];
+  tags: string[];
+  media: {
+    id: string;
+    storagePath: string;
+    mimeType: string | null;
+    createdAt: string;
+  }[];
+};

@@ -8,6 +8,8 @@ import { verifyOrgMembership } from "@/lib/tracker-queries";
 import { makeAvatar } from "@/lib/student-utils";
 import type { ClassGradeLevel, ClassRoom, Student, StudentClassEnrollment } from "@/lib/tracker-types";
 
+type ClassTeamRole = "co_teacher" | "assistant";
+
 export type JoinClassResult =
   | { ok: true; kind: "joined"; className: string }
   | { ok: true; kind: "already_enrolled"; className: string }
@@ -44,11 +46,12 @@ async function canTeacherActOnClass(
   if ((cls as { tutor_id: string | null }).tutor_id === userId) return true;
   const { data: ct } = await supabase
     .from("class_teachers")
-    .select("id")
+    .select("role")
     .eq("class_id", classId)
     .eq("profile_id", userId)
     .maybeSingle();
-  return Boolean(ct);
+  const role = (ct as { role?: string } | null)?.role;
+  return role === "co_teacher";
 }
 
 async function canManageClassTeachers(
@@ -59,14 +62,21 @@ async function canManageClassTeachers(
 ): Promise<boolean> {
   const orgRole = await fetchOrgMembershipRole(userId, organizationId);
   if (orgRole === "owner") return true;
-  if (orgRole !== "staff") return false;
   const { data: cls } = await supabase
     .from("classes")
     .select("tutor_id")
     .eq("organization_id", organizationId)
     .eq("id", classId)
     .maybeSingle();
-  return Boolean(cls && (cls as { tutor_id: string | null }).tutor_id === userId);
+  if (cls && (cls as { tutor_id: string | null }).tutor_id === userId) return true;
+  const { data: ct } = await supabase
+    .from("class_teachers")
+    .select("role")
+    .eq("organization_id", organizationId)
+    .eq("class_id", classId)
+    .eq("profile_id", userId)
+    .maybeSingle();
+  return (ct as { role?: string } | null)?.role === "co_teacher";
 }
 
 function generateJoinCode(existing: Set<string>): string {
@@ -393,6 +403,7 @@ export async function addClassTeacherAction(
   organizationId: string,
   classId: string,
   profileId: string,
+  classRole: ClassTeamRole = "co_teacher",
 ): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(organizationId);
   if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
@@ -402,15 +413,17 @@ export async function addClassTeacherAction(
 
   const { data: mem } = await ctx.supabase
     .from("organization_members")
-    .select("profile_id")
+    .select("profile_id, role")
     .eq("organization_id", organizationId)
     .eq("profile_id", profileId)
     .maybeSingle();
   if (!mem) return { ok: false, error: "That person is not a member of this organization." };
-
-  const { data: prof } = await ctx.supabase.from("profiles").select("app_role").eq("id", profileId).maybeSingle();
-  if ((prof as { app_role?: string } | null)?.app_role !== "teacher") {
-    return { ok: false, error: "Only teacher accounts can be assigned to a class." };
+  const memberRole = (mem as { role?: string } | null)?.role;
+  if (memberRole !== "owner" && memberRole !== "staff") {
+    return { ok: false, error: "Only organization staff can be assigned to a class team." };
+  }
+  if (classRole !== "co_teacher" && classRole !== "assistant") {
+    return { ok: false, error: "Invalid class role." };
   }
 
   const { data: cls } = await ctx.supabase
@@ -428,6 +441,7 @@ export async function addClassTeacherAction(
     organization_id: organizationId,
     class_id: classId,
     profile_id: profileId,
+    role: classRole,
   });
   if (error) {
     if (error.code === "23505") return { ok: false, error: "That teacher is already assigned to this class." };

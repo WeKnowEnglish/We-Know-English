@@ -281,6 +281,9 @@ export type ScheduleEvent = {
   startsAt: string;
 };
 
+/** 30 minutes before a scheduled start is eligible for "next session attendance". */
+export const ATTENDANCE_NEXT_WINDOW_MS = 30 * 60 * 1000;
+
 export function getScheduleEvents(
   classes: ClassRoom[],
   rangeStart: Date,
@@ -380,4 +383,27 @@ export function pickPrimaryAttendanceOccurrence(
     .filter((e) => +new Date(e.startsAt) <= nowMs)
     .sort((a, b) => +new Date(b.startsAt) - +new Date(a.startsAt));
   return past[0] ?? null;
+}
+
+/** Next scheduled occurrence that is eligible now (within 30 minutes before start, or any time after start). */
+export function pickNextAttendanceOccurrenceWithinWindow(
+  classRoom: ClassRoom,
+  options?: { now?: Date; scheduleTimeZone?: string },
+): ScheduleEvent | null {
+  const now = options?.now ?? new Date();
+  const tz = options?.scheduleTimeZone ?? getEnvScheduleTimeZone();
+  const start = subDays(now, 7);
+  const end = addDays(now, 30);
+  const events = getScheduleEvents([classRoom], start, end, tz).filter((e) => e.classId === classRoom.id);
+  if (events.length === 0) return null;
+
+  const nowMs = now.getTime();
+  const thresholdMs = nowMs + ATTENDANCE_NEXT_WINDOW_MS;
+  const eligible = events
+    .filter((e) => {
+      const eventMs = +new Date(e.startsAt);
+      return !Number.isNaN(eventMs) && eventMs <= thresholdMs;
+    })
+    .sort((a, b) => +new Date(a.startsAt) - +new Date(b.startsAt));
+  return eligible[0] ?? null;
 }
