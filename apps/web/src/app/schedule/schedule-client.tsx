@@ -25,11 +25,28 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { cn } from "@/lib/utils";
 
 const WEEK_OPTIONS = { weekStartsOn: 0 as const };
+const DEFAULT_CLASS_DURATION_MS = 50 * 60 * 1000;
+const ATTENDANCE_IMMINENT_MS = 30 * 60 * 1000;
+const ATTENDANCE_MISSED_RECENT_MS = 72 * 60 * 60 * 1000;
+
+function attendanceWindowKind(startsAtIso: string): "in_session" | "imminent" | "missed" | null {
+  const startMs = +new Date(startsAtIso);
+  if (Number.isNaN(startMs)) return null;
+  const nowMs = Date.now();
+  const endMs = startMs + DEFAULT_CLASS_DURATION_MS;
+  if (nowMs >= startMs && nowMs < endMs) return "in_session";
+  if (nowMs < startMs && startMs <= nowMs + ATTENDANCE_IMMINENT_MS) return "imminent";
+  if (nowMs >= endMs && nowMs - endMs <= ATTENDANCE_MISSED_RECENT_MS) return "missed";
+  return null;
+}
 
 export type ScheduleClientProps = {
   organizationId: string;
   scheduleTimeZone: string;
-  initialClasses: ClassRoom[];
+  orgRole: "owner" | "staff" | "client";
+  initialMyClassIds: string[];
+  initialAllClasses: ClassRoom[];
+  initialMyClasses: ClassRoom[];
 };
 
 function attendanceHrefForScheduleEvent(
@@ -49,14 +66,30 @@ function attendanceHrefForScheduleEvent(
   });
 }
 
-export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasses }: ScheduleClientProps) {
+export function ScheduleClient({
+  organizationId,
+  scheduleTimeZone,
+  orgRole,
+  initialMyClassIds,
+  initialAllClasses,
+  initialMyClasses,
+}: ScheduleClientProps) {
   const router = useRouter();
   const [cursor, setCursor] = useState(() => new Date());
-  const [classes, setClasses] = useState<ClassRoom[]>(initialClasses);
+  const [filterMode, setFilterMode] = useState<"all" | "mine">(orgRole === "owner" ? "all" : "mine");
+  const [allClasses, setAllClasses] = useState<ClassRoom[]>(initialAllClasses);
+  const [myClasses, setMyClasses] = useState<ClassRoom[]>(initialMyClasses);
+  const [myClassIds] = useState<string[]>(initialMyClassIds);
 
   useEffect(() => {
-    setClasses(initialClasses);
-  }, [initialClasses]);
+    setAllClasses(initialAllClasses);
+    setMyClasses(initialMyClasses);
+  }, [initialAllClasses, initialMyClasses]);
+
+  const classes = useMemo(() => {
+    if (orgRole === "owner") return filterMode === "all" ? allClasses : myClasses;
+    return myClasses;
+  }, [orgRole, filterMode, allClasses, myClasses]);
 
   const timeFormatter = useMemo(
     () => new Intl.DateTimeFormat(undefined, { hour: "numeric", minute: "2-digit" }),
@@ -83,6 +116,7 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
   const [occurrenceSessionMap, setOccurrenceSessionMap] = useState<
     Record<string, { sessionId: string; attendanceFinalized: boolean }>
   >({});
+  const [selectedOccurrenceKey, setSelectedOccurrenceKey] = useState<string | null>(null);
 
   useEffect(() => {
     const keys = [...new Set(events.map((e) => buildOccurrenceKey(e.classId, e.slotId, e.startsAt)))];
@@ -117,6 +151,38 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
     return map;
   }, [events]);
 
+  const eventByOccurrenceKey = useMemo(() => {
+    const map = new Map<string, (typeof events)[number]>();
+    for (const ev of events) {
+      map.set(buildOccurrenceKey(ev.classId, ev.slotId, ev.startsAt), ev);
+    }
+    return map;
+  }, [events]);
+
+  const selectedEvent = selectedOccurrenceKey ? eventByOccurrenceKey.get(selectedOccurrenceKey) ?? null : null;
+  const selectedEventFinalized =
+    selectedEvent != null
+      ? occurrenceSessionMap[buildOccurrenceKey(selectedEvent.classId, selectedEvent.slotId, selectedEvent.startsAt)]
+          ?.attendanceFinalized === true
+      : false;
+  const selectedEventWindowKind = selectedEvent ? attendanceWindowKind(selectedEvent.startsAt) : null;
+  const canTakeAttendance = Boolean(selectedEvent && !selectedEventFinalized && selectedEventWindowKind !== null);
+  const selectedEventAttendanceHref = selectedEvent
+    ? attendanceHrefForScheduleEvent(selectedEvent, occurrenceSessionMap, scheduleTimeZone)
+    : null;
+  const sessionDetailFormatter = useMemo(
+    () =>
+      new Intl.DateTimeFormat(undefined, {
+        weekday: "long",
+        month: "short",
+        day: "numeric",
+        year: "numeric",
+        hour: "numeric",
+        minute: "2-digit",
+      }),
+    [],
+  );
+
   const weekdayLabels = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
 
   return (
@@ -127,6 +193,16 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
           <p className="mt-1 text-sm text-muted-foreground">Month view of all class sessions from your stored classes.</p>
         </div>
         <div className="flex items-center gap-2">
+          {orgRole === "owner" ? (
+            <select
+              value={filterMode}
+              onChange={(event) => setFilterMode(event.target.value === "mine" ? "mine" : "all")}
+              className="h-8 rounded-md border border-input bg-background px-2 text-sm shadow-xs outline-none focus-visible:border-ring focus-visible:ring-2 focus-visible:ring-ring/50"
+            >
+              <option value="all">All classes in organization</option>
+              <option value="mine">Only my assigned classes</option>
+            </select>
+          ) : null}
           <Button type="button" size="sm" variant="outline" onClick={() => setCursor((d) => addMonths(d, -1))}>
             Previous
           </Button>
@@ -142,6 +218,12 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
           </Button>
         </div>
       </div>
+
+      {orgRole === "owner" && filterMode === "mine" && myClassIds.length === 0 ? (
+        <p className="text-sm text-muted-foreground">
+          You are an admin/owner, but no classes are directly assigned to you as lead, co-teacher, or assistant.
+        </p>
+      ) : null}
 
       {events.length === 0 ? (
         <Card>
@@ -197,19 +279,20 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
                       const occKey = buildOccurrenceKey(ev.classId, ev.slotId, ev.startsAt);
                       const finalized = occurrenceSessionMap[occKey]?.attendanceFinalized;
                       return (
-                        <Link
+                        <button
                           key={occKey}
-                          href={attendanceHrefForScheduleEvent(ev, occurrenceSessionMap, scheduleTimeZone)}
+                          type="button"
                           title={
                             finalized === true
                               ? `${ev.className} — view finalized attendance`
-                              : `${ev.className} — take or continue attendance`
+                              : `${ev.className} — view details`
                           }
-                          className="truncate rounded border border-border/80 bg-muted/40 px-1 py-0.5 text-[10px] font-medium leading-tight hover:bg-accent sm:text-xs"
+                          onClick={() => setSelectedOccurrenceKey(occKey)}
+                          className="w-full truncate rounded border border-border/80 bg-muted/40 px-1 py-0.5 text-left text-[10px] font-medium leading-tight hover:bg-accent sm:text-xs"
                         >
                           <span className="text-muted-foreground">{timeFormatter.format(new Date(ev.startsAt))}</span>{" "}
                           {ev.className}
-                        </Link>
+                        </button>
                       );
                     })}
                     {dayEvents.length > 4 ? (
@@ -222,6 +305,69 @@ export function ScheduleClient({ organizationId, scheduleTimeZone, initialClasse
           </div>
         </CardContent>
       </Card>
+
+      {selectedEvent ? (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-4">
+          <div className="w-full max-w-md rounded-lg border border-border bg-background p-4 shadow-lg">
+            <div className="mb-3 flex items-start justify-between gap-3">
+              <div>
+                <h2 className="text-base font-semibold">{selectedEvent.className}</h2>
+                <p className="text-sm text-muted-foreground">
+                  {sessionDetailFormatter.format(new Date(selectedEvent.startsAt))}
+                </p>
+              </div>
+              <Button type="button" size="sm" variant="ghost" onClick={() => setSelectedOccurrenceKey(null)}>
+                Close
+              </Button>
+            </div>
+
+            <div className="mb-4 space-y-1 text-sm">
+              <p>
+                <span className="font-medium">Status:</span> {selectedEventFinalized ? "Finalized" : "Not finalized"}
+              </p>
+              <p>
+                <span className="font-medium">Attendance window:</span>{" "}
+                {selectedEventWindowKind === "in_session"
+                  ? "In session"
+                  : selectedEventWindowKind === "imminent"
+                    ? "Starting soon"
+                    : selectedEventWindowKind === "missed"
+                      ? "Missed but still editable"
+                      : "Outside attendance window"}
+              </p>
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2">
+              {selectedEventAttendanceHref ? (
+                selectedEventFinalized ? (
+                  <Link
+                    href={selectedEventAttendanceHref}
+                    className={cn(buttonVariants({ variant: "outline", size: "sm" }))}
+                    onClick={() => setSelectedOccurrenceKey(null)}
+                  >
+                    View attendance
+                  </Link>
+                ) : canTakeAttendance ? (
+                  <Link
+                    href={selectedEventAttendanceHref}
+                    className={cn(buttonVariants({ variant: "default", size: "sm" }))}
+                    onClick={() => setSelectedOccurrenceKey(null)}
+                  >
+                    Take attendance
+                  </Link>
+                ) : (
+                  <Button type="button" size="sm" disabled>
+                    Take attendance
+                  </Button>
+                )
+              ) : null}
+              <Button type="button" size="sm" variant="ghost" onClick={() => setSelectedOccurrenceKey(null)}>
+                Cancel
+              </Button>
+            </div>
+          </div>
+        </div>
+      ) : null}
 
       <Link href="/onboarding" className="text-sm text-primary underline-offset-4 hover:underline">
         Back to classes

@@ -4,6 +4,7 @@ import { fetchOrgMembershipRole, getOrganizationShellContext } from "@/lib/organ
 import { getSession } from "@/lib/session";
 import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import {
+  fetchAssignedClassIdsForTeacher,
   fetchAttendanceSlotsForClass,
   fetchClassById,
   fetchClassTeacherPanelData,
@@ -40,13 +41,17 @@ export default async function ClassDetailPage({ params }: { params: Promise<{ cl
     notFound();
   }
 
-  const [students, enrollments, attendanceSlots, teacherPanel, scheduleTimeZone] = await Promise.all([
-    fetchStudentsForOrg(orgId),
-    fetchEnrollmentsForOrg(orgId),
+  const scopedClassIds =
+    orgRole === "owner" ? null : await fetchAssignedClassIdsForTeacher(orgId, user.id);
+
+  const [enrollments, attendanceSlots, teacherPanel, scheduleTimeZone] = await Promise.all([
+    fetchEnrollmentsForOrg(orgId, scopedClassIds),
     fetchAttendanceSlotsForClass(orgId, classRoom),
     fetchClassTeacherPanelData(orgId, classId, { userId: user.id, orgRole }),
     getScheduleTimezoneForOrganization(orgId),
   ]);
+  const visibleStudentIds = [...new Set(enrollments.map((row) => row.studentId))];
+  const students = await fetchStudentsForOrg(orgId, scopedClassIds ? visibleStudentIds : null);
 
   return (
     <ClassDetailClient

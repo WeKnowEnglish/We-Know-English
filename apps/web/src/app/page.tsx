@@ -1,4 +1,5 @@
 import Link from "next/link";
+import { MissedAttendanceBanner } from "@/components/missed-attendance-banner";
 import { Card, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { StudentJoinClassPanel } from "@/components/student-join-class-panel";
 import { StudentMyClassesPanel } from "@/components/student-my-classes-panel";
@@ -6,7 +7,12 @@ import { TeacherHomePanel } from "@/components/teacher-home-panel";
 import { getNavGroupsForRole } from "@/lib/nav";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { fetchClassesForOrg, fetchStudentEnrollmentClasses, resolveTeacherClassAccess } from "@/lib/tracker-queries";
+import {
+  fetchClassesForOrg,
+  fetchMissedAttendanceOccurrences,
+  fetchStudentEnrollmentClasses,
+  resolveTeacherClassAccess,
+} from "@/lib/tracker-queries";
 
 function toDisplayName(value: string) {
   return value
@@ -43,11 +49,13 @@ export default async function Home() {
 
   let recentClasses: Awaited<ReturnType<typeof fetchClassesForOrg>> = [];
   let studentEnrollments: Awaited<ReturnType<typeof fetchStudentEnrollmentClasses>> = [];
+  let missedAttendance: Awaited<ReturnType<typeof fetchMissedAttendanceOccurrences>> = [];
   if (isTeacherView && user?.id) {
     const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole: "teacher" });
     if (orgCtx.activeOrganizationId) {
       const access = await resolveTeacherClassAccess(user.id, orgCtx.activeOrganizationId);
       const all = await fetchClassesForOrg(orgCtx.activeOrganizationId, access);
+      missedAttendance = await fetchMissedAttendanceOccurrences(orgCtx.activeOrganizationId, access);
       recentClasses = [...all]
         .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
         .slice(0, 3);
@@ -58,6 +66,7 @@ export default async function Home() {
 
   return (
     <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col gap-10 px-4 py-10">
+      {isTeacherView && missedAttendance.length > 0 ? <MissedAttendanceBanner items={missedAttendance} /> : null}
       {isTeacherView ? (
         <TeacherHomePanel welcomeName={welcomeName} dateTimeLabel={dateTimeLabel} recentClasses={recentClasses} />
       ) : (

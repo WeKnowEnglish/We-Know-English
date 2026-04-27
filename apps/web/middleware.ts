@@ -47,7 +47,9 @@ export async function middleware(request: NextRequest) {
 
   if (
     authError &&
-    (authError.message.includes("Already Used") || authError.message.includes("Invalid Refresh Token"))
+    (authError.message.includes("Already Used") ||
+      authError.message.includes("Invalid Refresh Token") ||
+      authError.message.includes("Refresh Token Not Found"))
   ) {
     try {
       await supabase.auth.signOut();

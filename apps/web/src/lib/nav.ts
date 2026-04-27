@@ -74,9 +74,9 @@ export const NAV_GROUPS: NavGroup[] = [
       },
       {
         href: "/feed",
-        label: "Feed & AI",
+        label: "Class Feed",
         icon: "newspaper",
-        description: "Quick tags into a 3-sentence parent update.",
+        description: "Post class updates, tag students, and publish to parent pulse.",
       },
       {
         href: "/students",

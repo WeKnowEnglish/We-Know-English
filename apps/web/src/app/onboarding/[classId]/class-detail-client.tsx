@@ -19,6 +19,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Button } from "@/components/ui/button";
 import { buildAttendanceUrl } from "@/lib/attendance-utils";
 import {
+  ATTENDANCE_NEXT_WINDOW_MS,
   addWeeklyRuleToClass,
   buildOccurrenceKey,
   getWeeklyRulesFromClass,
@@ -27,7 +28,7 @@ import {
   makeSlotId,
   makeWeeklyRuleId,
   normalizeClassForRead,
-  pickPrimaryAttendanceOccurrence,
+  pickNextAttendanceOccurrenceWithinWindow,
   removeWeeklyRuleFromClass,
   sessionDateFromScheduleInstant,
   withScheduleSlots,
@@ -106,6 +107,8 @@ export function ClassDetailClient({
   const [draftFrom, setDraftFrom] = useState("");
   const [teacherPanel, setTeacherPanel] = useState(initialTeacherPanel);
   const [pickTeacherId, setPickTeacherId] = useState("");
+  const [pickTeacherRole, setPickTeacherRole] = useState<"co_teacher" | "assistant">("co_teacher");
+  const [attendanceLaunchError, setAttendanceLaunchError] = useState<string | null>(null);
 
   const rawClass = rawClassState.id === classId ? rawClassState : null;
   const classRoom = useMemo(() => (rawClass ? normalizeClassForRead(rawClass) : null), [rawClass]);
@@ -186,9 +189,27 @@ export function ClassDetailClient({
 
   const attendanceReturnTo = `/onboarding/${classId}`;
 
-  const startAttendanceSession = () => {
-    const occ = pickPrimaryAttendanceOccurrence(classRoom, { scheduleTimeZone });
-    if (!occ) return;
+  const startNewSessionAttendance = () => {
+    setAttendanceLaunchError(null);
+    const sessionDate = sessionDateFromScheduleInstant(new Date(), scheduleTimeZone);
+    router.push(
+      buildAttendanceUrl({
+        classId,
+        sessionDate,
+        returnTo: attendanceReturnTo,
+      }),
+    );
+  };
+
+  const startNextScheduledAttendance = () => {
+    const occ = pickNextAttendanceOccurrenceWithinWindow(classRoom, { scheduleTimeZone });
+    if (!occ) {
+      setAttendanceLaunchError(
+        `No eligible upcoming session yet. "Next session attendance" opens from 30 minutes before the scheduled start onward.`,
+      );
+      return;
+    }
+    setAttendanceLaunchError(null);
     const key = buildOccurrenceKey(occ.classId, occ.slotId, occ.startsAt);
     const sessionDate = sessionDateFromScheduleInstant(occ.startsAt, scheduleTimeZone);
     router.push(
@@ -422,10 +443,10 @@ export function ClassDetailClient({
 
       <Card className="w-full max-w-4xl">
         <CardHeader>
-          <CardTitle className="text-base">Teachers</CardTitle>
+          <CardTitle className="text-base">Class team</CardTitle>
           <CardDescription>
-            Lead instructor and co-teachers from your organization. Co-teachers see this class in their schedule and
-            attendance lists. Only the organization owner or the lead instructor can add or remove co-teachers.
+            Lead instructor, co-teachers, and assistants from your organization. Co-teachers can manage this class
+            (except delete). Assistants can submit attendance for a new session and support class timeline posts.
           </CardDescription>
         </CardHeader>
         <CardContent className="space-y-3">
@@ -441,7 +462,15 @@ export function ClassDetailClient({
                     <Badge variant="secondary" className="ml-2">
                       Lead
                     </Badge>
-                  ) : null}
+                  ) : row.classRole === "assistant" ? (
+                    <Badge variant="outline" className="ml-2">
+                      Assistant
+                    </Badge>
+                  ) : (
+                    <Badge variant="outline" className="ml-2">
+                      Co-teacher
+                    </Badge>
+                  )}
                 </span>
                 {teacherPanel.canManage && !row.isPrimary ? (
                   <Button
@@ -469,7 +498,7 @@ export function ClassDetailClient({
             <div className="flex flex-wrap items-end gap-2">
               <div className="flex min-w-[12rem] flex-1 flex-col gap-1">
                 <label htmlFor="add-co-teacher" className="text-xs font-medium text-muted-foreground">
-                  Add co-teacher
+                  Add teammate
                 </label>
                 <select
                   id="add-co-teacher"
@@ -485,6 +514,20 @@ export function ClassDetailClient({
                   ))}
                 </select>
               </div>
+              <div className="flex min-w-[10rem] flex-col gap-1">
+                <label htmlFor="add-class-role" className="text-xs font-medium text-muted-foreground">
+                  Role
+                </label>
+                <select
+                  id="add-class-role"
+                  className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                  value={pickTeacherRole}
+                  onChange={(e) => setPickTeacherRole(e.target.value === "assistant" ? "assistant" : "co_teacher")}
+                >
+                  <option value="co_teacher">Co-teacher</option>
+                  <option value="assistant">Assistant</option>
+                </select>
+              </div>
               <Button
                 type="button"
                 size="sm"
@@ -492,13 +535,15 @@ export function ClassDetailClient({
                 onClick={() => {
                   const pid = pickTeacherId;
                   if (!pid) return;
+                  const role = pickTeacherRole;
                   startTransition(async () => {
-                    const res = await addClassTeacherAction(organizationId, classId, pid);
+                    const res = await addClassTeacherAction(organizationId, classId, pid, role);
                     if (!res.ok) {
                       window.alert(res.error);
                       return;
                     }
                     setPickTeacherId("");
+                    setPickTeacherRole("co_teacher");
                     router.refresh();
                   });
                 }}
@@ -508,10 +553,10 @@ export function ClassDetailClient({
             </div>
           ) : null}
           {!teacherPanel.canManage ? (
-            <p className="text-xs text-muted-foreground">Ask the lead instructor or owner to assign co-teachers.</p>
+            <p className="text-xs text-muted-foreground">Ask the lead instructor, co-teacher, or owner to assign class roles.</p>
           ) : null}
           {teacherPanel.canManage && teacherPanel.addCandidates.length === 0 ? (
-            <p className="text-xs text-muted-foreground">All organization teachers are already on this class.</p>
+            <p className="text-xs text-muted-foreground">All eligible organization staff are already on this class.</p>
           ) : null}
         </CardContent>
       </Card>
@@ -520,17 +565,26 @@ export function ClassDetailClient({
         <Card className="w-full border-emerald-200 bg-emerald-50/70 dark:border-emerald-900 dark:bg-emerald-950/20">
           <CardHeader>
             <CardTitle className="text-base">Session attendance</CardTitle>
-            <CardDescription>Start from the next scheduled slot for this class.</CardDescription>
+            <CardDescription>
+              Use a new ad-hoc session anytime, or use the next scheduled session from {ATTENDANCE_NEXT_WINDOW_MS / 60000}{" "}
+              minutes before start onward.
+            </CardDescription>
           </CardHeader>
-          <CardContent>
-            <Button
-              type="button"
-              size="lg"
-              className="h-12 w-full max-w-[240px] bg-emerald-600 px-6 text-base text-white hover:bg-emerald-700"
-              onClick={startAttendanceSession}
-            >
-              Take attendance
-            </Button>
+          <CardContent className="space-y-3">
+            <div className="flex flex-wrap gap-2">
+              <Button
+                type="button"
+                size="sm"
+                className="bg-emerald-600 text-white hover:bg-emerald-700"
+                onClick={startNewSessionAttendance}
+              >
+                New session attendance
+              </Button>
+              <Button type="button" size="sm" variant="secondary" onClick={startNextScheduledAttendance}>
+                Next session attendance
+              </Button>
+            </div>
+            {attendanceLaunchError ? <p className="text-xs text-muted-foreground">{attendanceLaunchError}</p> : null}
           </CardContent>
         </Card>
 
@@ -857,19 +911,16 @@ export function ClassDetailClient({
 
           {roster.length > 0 ? (
             roster.map((student) => (
-              <div
-                key={student.id}
-                className={cn(
-                  "flex items-center justify-between rounded-lg border border-border px-3 py-2",
-                  removeMode && "border-red-300 bg-red-50 dark:border-red-900/50 dark:bg-red-950/20",
-                )}
-              >
-                <div>
-                  <p className="font-medium">{student.fullName}</p>
-                  <p className="text-sm text-muted-foreground">{student.level}</p>
-                </div>
-                <div className="flex items-center gap-2">
-                  {removeMode ? (
+              removeMode ? (
+                <div
+                  key={student.id}
+                  className={cn("flex items-center justify-between rounded-lg border border-red-300 bg-red-50 px-3 py-2 dark:border-red-900/50 dark:bg-red-950/20")}
+                >
+                  <div>
+                    <p className="font-medium">{student.fullName}</p>
+                    <p className="text-sm text-muted-foreground">{student.level}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
                     <button
                       type="button"
                       aria-label={`Mark ${student.fullName} for removal`}
@@ -883,10 +934,24 @@ export function ClassDetailClient({
                     >
                       ×
                     </button>
-                  ) : null}
-                  <Badge variant="outline">{student.avatar}</Badge>
+                    <Badge variant="outline">{student.avatar}</Badge>
+                  </div>
                 </div>
-              </div>
+              ) : (
+                <Link
+                  key={student.id}
+                  href={`/students/${encodeURIComponent(student.id)}`}
+                  className="flex items-center justify-between rounded-lg border border-border px-3 py-2 transition-colors hover:bg-accent/40"
+                >
+                  <div>
+                    <p className="font-medium text-primary underline-offset-4 hover:underline">{student.fullName}</p>
+                    <p className="text-sm text-muted-foreground">{student.level}</p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Badge variant="outline">{student.avatar}</Badge>
+                  </div>
+                </Link>
+              )
             ))
           ) : (
             <p className="text-sm text-muted-foreground">No students enrolled yet.</p>
