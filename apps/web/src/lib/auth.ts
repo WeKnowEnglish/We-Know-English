@@ -15,6 +15,7 @@ export function appRoleFromUser(user: User | null): AppRole | null {
 /** Tutor tools and billing — not shown to students in nav / blocked in middleware */
 export const TEACHER_ROUTE_PREFIXES = [
   "/attendance",
+  "/classes",
   "/moments",
   "/feed",
   "/onboarding",

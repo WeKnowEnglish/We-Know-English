@@ -3,6 +3,7 @@ import { StudentsClient } from "@/app/students/students-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
 import {
+  fetchAssignedClassIdsForTeacher,
   fetchClassesForOrg,
   fetchEnrollmentsForOrg,
   fetchStudentsForOrg,
@@ -22,11 +23,16 @@ export default async function StudentsManagementPage() {
   }
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const [students, classes, enrollments] = await Promise.all([
-    fetchStudentsForOrg(orgId),
+  const scopedClassIds =
+    access && (access.orgRole === "staff" || access.orgRole === "client")
+      ? await fetchAssignedClassIdsForTeacher(orgId, user.id)
+      : null;
+  const [classes, enrollments] = await Promise.all([
     fetchClassesForOrg(orgId, access),
-    fetchEnrollmentsForOrg(orgId),
+    fetchEnrollmentsForOrg(orgId, scopedClassIds),
   ]);
+  const scopedStudentIds = [...new Set(enrollments.map((row) => row.studentId))];
+  const students = await fetchStudentsForOrg(orgId, scopedClassIds ? scopedStudentIds : null);
 
   return (
     <StudentsClient

@@ -221,3 +221,63 @@ export async function updateOrganizationScheduleTimezoneAction(
   revalidatePath("/attendance");
   return { ok: true };
 }
+
+export type EditableOrgRole = "owner" | "staff" | "client";
+
+export async function updateOrganizationMemberRoleAction(params: {
+  organizationId: string;
+  profileId: string;
+  role: EditableOrgRole;
+}): Promise<{ ok: true } | { ok: false; error: string }> {
+  const organizationId = params.organizationId.trim();
+  const profileId = params.profileId.trim();
+  const role = params.role;
+  if (!organizationId) return { ok: false, error: "Organization is required" };
+  if (!profileId) return { ok: false, error: "Member is required" };
+  if (role !== "owner" && role !== "staff" && role !== "client") {
+    return { ok: false, error: "Invalid role" };
+  }
+
+  const { supabase, user } = await requireUser();
+  if (!supabase || !user) return { ok: false, error: "Not signed in" };
+
+  const { data, error } = await supabase.rpc("update_organization_member_role", {
+    p_organization_id: organizationId,
+    p_profile_id: profileId,
+    p_role: role,
+  });
+  if (error) return { ok: false, error: error.message };
+
+  const row = data as { ok?: boolean; error?: string } | null;
+  if (!row || row.ok !== true) {
+    return { ok: false, error: typeof row?.error === "string" ? row.error : "Could not update member role" };
+  }
+
+  revalidatePath("/organizations");
+  revalidatePath(`/organizations/${organizationId}`);
+  return { ok: true };
+}
+
+export async function deleteOrganizationAction(organizationId: string): Promise<{ ok: true } | { ok: false; error: string }> {
+  const trimmedId = organizationId.trim();
+  if (!trimmedId) return { ok: false, error: "Organization is required" };
+
+  const { supabase, user } = await requireUser();
+  if (!supabase || !user) return { ok: false, error: "Not signed in" };
+
+  const { data, error } = await supabase.rpc("delete_organization_as_owner", {
+    p_organization_id: trimmedId,
+  });
+  if (error) return { ok: false, error: error.message };
+  const row = data as { ok?: boolean; error?: string } | null;
+  if (!row || row.ok !== true) {
+    return { ok: false, error: typeof row?.error === "string" ? row.error : "Could not delete organization" };
+  }
+
+  const cookieStore = await cookies();
+  cookieStore.delete(WKE_ACTIVE_ORG_COOKIE);
+
+  revalidatePath("/organizations");
+  revalidatePath(`/organizations/${trimmedId}`);
+  return { ok: true };
+}

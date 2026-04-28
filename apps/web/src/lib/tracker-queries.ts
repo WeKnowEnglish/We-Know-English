@@ -16,7 +16,7 @@ import {
   enrollmentRowToEnrollment,
   studentRowToStudent,
 } from "@/lib/tracker-mappers";
-import type { AttendanceStatus, ClassRoom, Student, StudentClassEnrollment } from "@/lib/tracker-types";
+import type { AttendanceStatus, ClassFeedPost, ClassRoom, Student, StudentClassEnrollment } from "@/lib/tracker-types";
 
 export async function verifyOrgMembership(userId: string, organizationId: string): Promise<boolean> {
   const supabase = await createServerSupabaseClient();
@@ -93,18 +93,10 @@ export async function fetchClassesForOrg(
     .eq("organization_id", organizationId)
     .order("created_at", { ascending: false });
 
-  if (access && access.orgRole === "staff") {
-    const { data: ctRows } = await supabase
-      .from("class_teachers")
-      .select("class_id")
-      .eq("organization_id", organizationId)
-      .eq("profile_id", access.userId);
-    const extraIds = [...new Set((ctRows ?? []).map((r) => r.class_id as string))];
-    const orParts = [`tutor_id.eq.${access.userId}`];
-    if (extraIds.length > 0) {
-      orParts.push(`id.in.(${extraIds.join(",")})`);
-    }
-    query = query.or(orParts.join(","));
+  if (access && (access.orgRole === "staff" || access.orgRole === "client")) {
+    const allowedClassIds = await fetchAssignedClassIdsForTeacher(organizationId, access.userId);
+    if (allowedClassIds.length === 0) return [];
+    query = query.in("id", allowedClassIds);
   }
 
   const { data, error } = await query;
@@ -112,25 +104,52 @@ export async function fetchClassesForOrg(
   return data.map((row) => classRowToClassRoom(row as Parameters<typeof classRowToClassRoom>[0]));
 }
 
-export async function fetchStudentsForOrg(organizationId: string): Promise<Student[]> {
+export async function fetchAssignedClassIdsForTeacher(organizationId: string, userId: string): Promise<string[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
-  const { data, error } = await supabase
+  const [leadClasses, coTeacherClasses] = await Promise.all([
+    supabase.from("classes").select("id").eq("organization_id", organizationId).eq("tutor_id", userId),
+    supabase
+      .from("class_teachers")
+      .select("class_id")
+      .eq("organization_id", organizationId)
+      .eq("profile_id", userId),
+  ]);
+  const out = new Set<string>();
+  for (const row of (leadClasses.data ?? []) as { id: string }[]) out.add(row.id);
+  for (const row of (coTeacherClasses.data ?? []) as { class_id: string }[]) out.add(row.class_id);
+  return [...out];
+}
+
+export async function fetchStudentsForOrg(organizationId: string, studentIds?: string[] | null): Promise<Student[]> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return [];
+  if (studentIds && studentIds.length === 0) return [];
+  let query = supabase
     .from("students")
     .select("id, full_name, level, email, birthdate, skills_points, linked_user_id, profile")
     .eq("organization_id", organizationId)
     .order("created_at", { ascending: false });
+  if (studentIds && studentIds.length > 0) {
+    query = query.in("id", studentIds);
+  }
+  const { data, error } = await query;
   if (error || !data) return [];
   return data.map((row) => studentRowToStudent(row as Parameters<typeof studentRowToStudent>[0]));
 }
 
-export async function fetchEnrollmentsForOrg(organizationId: string): Promise<StudentClassEnrollment[]> {
+export async function fetchEnrollmentsForOrg(
+  organizationId: string,
+  classIds?: string[] | null,
+): Promise<StudentClassEnrollment[]> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return [];
-  const { data, error } = await supabase
-    .from("enrollments")
-    .select("student_id, class_id, created_at")
-    .eq("organization_id", organizationId);
+  if (classIds && classIds.length === 0) return [];
+  let query = supabase.from("enrollments").select("student_id, class_id, created_at").eq("organization_id", organizationId);
+  if (classIds && classIds.length > 0) {
+    query = query.in("class_id", classIds);
+  }
+  const { data, error } = await query;
   if (error || !data) return [];
   return data.map((row) => enrollmentRowToEnrollment(row as Parameters<typeof enrollmentRowToEnrollment>[0]));
 }
@@ -152,9 +171,14 @@ export type ClassTeacherRosterEntry = {
   profileId: string;
   fullName: string;
   isPrimary: boolean;
+  classRole: "lead" | "co_teacher" | "assistant";
 };
 
-export type TeacherPickOption = { profileId: string; fullName: string };
+export type TeacherPickOption = {
+  profileId: string;
+  fullName: string;
+  orgRole: "owner" | "staff";
+};
 
 export async function fetchClassTeacherPanelData(
   organizationId: string,
@@ -190,26 +214,29 @@ export async function fetchClassTeacherPanelData(
 
   const { data: ctRows } = await supabase
     .from("class_teachers")
-    .select("profile_id, profiles(full_name)")
+    .select("profile_id, role, profiles(full_name)")
     .eq("organization_id", organizationId)
     .eq("class_id", classId);
 
   const rosterMap = new Map<string, ClassTeacherRosterEntry>();
   if (tutorId) {
-    rosterMap.set(tutorId, { profileId: tutorId, fullName: tutorName, isPrimary: true });
+    rosterMap.set(tutorId, { profileId: tutorId, fullName: tutorName, isPrimary: true, classRole: "lead" });
   }
   for (const raw of ctRows ?? []) {
     const row = raw as {
       profile_id: string;
+      role: string | null;
       profiles: { full_name: string } | { full_name: string }[] | null;
     };
     const p = row.profiles;
     const name = p && !Array.isArray(p) ? p.full_name : Array.isArray(p) && p[0] ? p[0].full_name : "Teacher";
     const isPrimary = row.profile_id === tutorId;
+    const classRole = row.role === "assistant" ? "assistant" : "co_teacher";
     rosterMap.set(row.profile_id, {
       profileId: row.profile_id,
       fullName: name,
       isPrimary,
+      classRole: isPrimary ? "lead" : classRole,
     });
   }
 
@@ -222,25 +249,28 @@ export async function fetchClassTeacherPanelData(
 
   const { data: members } = await supabase
     .from("organization_members")
-    .select("profile_id, profiles(full_name, app_role)")
+    .select("profile_id, role, profiles(full_name)")
     .eq("organization_id", organizationId);
 
   const addCandidates: TeacherPickOption[] = [];
   for (const raw of members ?? []) {
     const row = raw as {
       profile_id: string;
-      profiles: { full_name: string; app_role: string } | { full_name: string; app_role: string }[] | null;
+      role: string;
+      profiles: { full_name: string } | { full_name: string }[] | null;
     };
     const p = row.profiles;
     const pr = p && !Array.isArray(p) ? p : Array.isArray(p) ? p[0] : null;
-    if (!pr || pr.app_role !== "teacher") continue;
+    if (!pr) continue;
+    if (row.role !== "owner" && row.role !== "staff") continue;
     if (assigned.has(row.profile_id)) continue;
-    addCandidates.push({ profileId: row.profile_id, fullName: pr.full_name });
+    addCandidates.push({ profileId: row.profile_id, fullName: pr.full_name, orgRole: row.role });
   }
   addCandidates.sort((a, b) => a.fullName.localeCompare(b.fullName));
 
+  const viewerClassRole = rosterMap.get(viewer.userId)?.classRole ?? null;
   const canManage =
-    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
+    viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId) || viewerClassRole === "co_teacher";
 
   const viewerMayDeleteClass =
     viewer.orgRole === "owner" || (tutorId !== null && tutorId === viewer.userId);
@@ -1259,4 +1289,115 @@ export async function fetchAttendanceSlotsForClass(
   });
   rows.sort((a, b) => +new Date(b.startsAt) - +new Date(a.startsAt));
   return rows.slice(0, 36);
+}
+
+type ClassFeedPostRow = {
+  id: string;
+  organization_id: string;
+  class_id: string;
+  title: string | null;
+  body: string;
+  status: "draft" | "published";
+  visibility: "internal" | "parent_visible";
+  pinned: boolean;
+  archived_at: string | null;
+  published_at: string | null;
+  created_at: string;
+  updated_at: string;
+  created_by: string;
+  published_by: string | null;
+};
+
+export async function fetchClassFeedPosts(params: {
+  organizationId: string;
+  classId: string;
+  includeDrafts?: boolean;
+}): Promise<{ posts: ClassFeedPost[]; error: string | null }> {
+  const supabase = await createServerSupabaseClient();
+  if (!supabase) return { posts: [], error: "Supabase client unavailable" };
+
+  let query = supabase
+    .from("feed_posts")
+    .select("id, organization_id, class_id, title, body, status, visibility, pinned, archived_at, published_at, created_at, updated_at, created_by, published_by")
+    .eq("organization_id", params.organizationId)
+    .eq("class_id", params.classId)
+    .is("archived_at", null)
+    .order("pinned", { ascending: false })
+    .order("created_at", { ascending: false });
+
+  if (!params.includeDrafts) {
+    query = query.eq("status", "published");
+  }
+
+  const { data, error } = await query;
+  if (error) return { posts: [], error: error.message };
+  if (!data?.length) return { posts: [], error: null };
+  const posts = data as ClassFeedPostRow[];
+
+  const postIds = posts.map((p) => p.id);
+  const [studentRows, tagRows, mediaRows] = await Promise.all([
+    supabase.from("class_post_students").select("post_id, student_id").in("post_id", postIds),
+    supabase.from("class_post_tags").select("post_id, tag").in("post_id", postIds),
+    supabase
+      .from("class_post_media")
+      .select("id, post_id, storage_path, mime_type, created_at")
+      .in("post_id", postIds)
+      .order("sort_order", { ascending: true })
+      .order("created_at", { ascending: true }),
+  ]);
+
+  const studentsByPost = new Map<string, string[]>();
+  for (const row of (studentRows.data ?? []) as { post_id: string; student_id: string }[]) {
+    const prev = studentsByPost.get(row.post_id) ?? [];
+    prev.push(row.student_id);
+    studentsByPost.set(row.post_id, prev);
+  }
+
+  const tagsByPost = new Map<string, string[]>();
+  for (const row of (tagRows.data ?? []) as { post_id: string; tag: string }[]) {
+    const prev = tagsByPost.get(row.post_id) ?? [];
+    prev.push(row.tag);
+    tagsByPost.set(row.post_id, prev);
+  }
+
+  const mediaByPost = new Map<string, ClassFeedPost["media"]>();
+  for (const row of (mediaRows.data ?? []) as {
+    id: string;
+    post_id: string;
+    storage_path: string;
+    mime_type: string | null;
+    created_at: string;
+  }[]) {
+    const prev = mediaByPost.get(row.post_id) ?? [];
+    prev.push({
+      id: row.id,
+      storagePath: row.storage_path,
+      mimeType: row.mime_type,
+      createdAt: row.created_at,
+    });
+    mediaByPost.set(row.post_id, prev);
+  }
+
+  const mapped = posts.map((row) => ({
+    id: row.id,
+    organizationId: row.organization_id,
+    classId: row.class_id,
+    title: row.title,
+    body: row.body,
+    status: row.status,
+    visibility: row.visibility,
+    pinned: row.pinned,
+    archivedAt: row.archived_at,
+    publishedAt: row.published_at,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at,
+    createdBy: row.created_by,
+    publishedBy: row.published_by,
+    studentIds: studentsByPost.get(row.id) ?? [],
+    tags: tagsByPost.get(row.id) ?? [],
+    media: mediaByPost.get(row.id) ?? [],
+  }));
+  const secondaryError =
+    studentRows.error?.message ?? tagRows.error?.message ?? mediaRows.error?.message ?? null;
+  return { posts: mapped, error: secondaryError };
 }

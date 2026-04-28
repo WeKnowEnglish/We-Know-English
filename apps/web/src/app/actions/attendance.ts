@@ -5,6 +5,8 @@ import { createServerSupabaseClient } from "@/lib/supabase/server";
 import { fetchAttendanceOccurrenceStatusMap, verifyOrgMembership } from "@/lib/tracker-queries";
 import type { AttendanceStatus } from "@/lib/tracker-types";
 
+type ClassAttendanceRole = "lead" | "co_teacher" | "assistant" | "none";
+
 async function requireTeacherOrg(organizationId: string) {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return { supabase: null, userId: null as string | null, ok: false as const };
@@ -15,6 +17,33 @@ async function requireTeacherOrg(organizationId: string) {
   const ok = await verifyOrgMembership(user.id, organizationId);
   if (!ok) return { supabase, userId: user.id, ok: false as const };
   return { supabase, userId: user.id, ok: true as const };
+}
+
+async function resolveClassAttendanceRole(
+  supabase: NonNullable<Awaited<ReturnType<typeof createServerSupabaseClient>>>,
+  organizationId: string,
+  classId: string,
+  userId: string,
+): Promise<ClassAttendanceRole> {
+  const { data: cls } = await supabase
+    .from("classes")
+    .select("tutor_id")
+    .eq("organization_id", organizationId)
+    .eq("id", classId)
+    .maybeSingle();
+  const tutorId = (cls as { tutor_id: string | null } | null)?.tutor_id;
+  if (tutorId && tutorId === userId) return "lead";
+
+  const { data: ct } = await supabase
+    .from("class_teachers")
+    .select("role")
+    .eq("organization_id", organizationId)
+    .eq("class_id", classId)
+    .eq("profile_id", userId)
+    .maybeSingle();
+  const role = (ct as { role?: string } | null)?.role;
+  if (role === "co_teacher" || role === "assistant") return role;
+  return "none";
 }
 
 export async function saveAttendanceBundleAction(params: {
@@ -91,7 +120,21 @@ export async function reopenAttendanceSessionAction(params: {
   sessionId: string;
 }): Promise<{ ok: true } | { ok: false; error: string }> {
   const ctx = await requireTeacherOrg(params.organizationId);
-  if (!ctx.ok || !ctx.supabase) return { ok: false, error: "Unauthorized" };
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const { data: sess } = await ctx.supabase
+    .from("sessions")
+    .select("class_id")
+    .eq("organization_id", params.organizationId)
+    .eq("id", params.sessionId)
+    .maybeSingle();
+  const classId = (sess as { class_id?: string } | null)?.class_id;
+  if (!classId) return { ok: false, error: "Session not found" };
+
+  const classRole = await resolveClassAttendanceRole(ctx.supabase, params.organizationId, classId, ctx.userId);
+  if (classRole !== "lead" && classRole !== "co_teacher") {
+    return { ok: false, error: "Only lead teachers and co-teachers can reopen attendance." };
+  }
 
   const { error } = await ctx.supabase
     .from("sessions")

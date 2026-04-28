@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Building2,
   CalendarCheck,
@@ -30,10 +30,9 @@ import { cn } from "@/lib/utils";
 import { getNavGroupsForRole, type NavIconName, type NavLink } from "@/lib/nav";
 import type { AppRole } from "@/lib/auth";
 import { LogoutButton } from "@/components/logout-button";
-import { MissedAttendanceBanner } from "@/components/missed-attendance-banner";
 import { OrganizationSwitcher } from "@/components/organization-switcher";
 import type { OrgSummary } from "@/lib/organization-server";
-import type { MissedAttendanceItem } from "@/lib/tracker-queries";
+import { createClient } from "@/lib/supabase/client";
 
 type AppShellProps = {
   userEmail: string | null;
@@ -44,7 +43,6 @@ type AppShellProps = {
   headerTitle: string;
   organizations: OrgSummary[];
   activeOrganizationId: string | null;
-  missedAttendance?: MissedAttendanceItem[];
 };
 
 const ICONS: Record<NavIconName, LucideIcon> = {
@@ -108,7 +106,6 @@ export function AppShell({
   headerTitle,
   organizations,
   activeOrganizationId,
-  missedAttendance = [],
 }: AppShellProps) {
   const pathname = usePathname();
   const navGroups = getNavGroupsForRole(appRole);
@@ -127,6 +124,7 @@ export function AppShell({
   const hoverOpenTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hoverCloseTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const sidebarExpanded = desktopExpanded || desktopHoverExpanded;
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const clearHoverTimers = () => {
     if (hoverOpenTimerRef.current) clearTimeout(hoverOpenTimerRef.current);
@@ -157,6 +155,50 @@ export function AppShell({
     }
     setMobileOpen((v) => !v);
   };
+
+  useEffect(() => {
+    if (!userEmail) return;
+    const TEN_MINUTES = 10 * 60 * 1000;
+    const events: Array<keyof WindowEventMap> = ["mousemove", "keydown", "click", "scroll", "touchstart"];
+
+    const clearTimer = () => {
+      if (idleTimerRef.current) {
+        clearTimeout(idleTimerRef.current);
+        idleTimerRef.current = null;
+      }
+    };
+
+    const logoutForInactivity = async () => {
+      try {
+        const supabase = createClient();
+        if (supabase) {
+          await supabase.auth.signOut();
+        }
+      } catch {
+        /* ignore */
+      }
+      window.location.href = "/login?reason=idle";
+    };
+
+    const resetTimer = () => {
+      clearTimer();
+      idleTimerRef.current = setTimeout(() => {
+        void logoutForInactivity();
+      }, TEN_MINUTES);
+    };
+
+    resetTimer();
+    for (const eventName of events) {
+      window.addEventListener(eventName, resetTimer, { passive: true });
+    }
+
+    return () => {
+      clearTimer();
+      for (const eventName of events) {
+        window.removeEventListener(eventName, resetTimer);
+      }
+    };
+  }, [userEmail]);
 
   return (
     <div className="flex min-h-full flex-1 flex-col">
@@ -205,16 +247,6 @@ export function AppShell({
           </div>
         </div>
       </header>
-
-      {missedAttendance.length > 0 && appRole === "teacher" ? (
-        <div className="border-b border-destructive/30 bg-destructive/10 px-4 py-1.5 text-center text-xs font-medium text-destructive">
-          {missedAttendance.length} class session(s) need finalized attendance — see popup, or{" "}
-          <Link href="/attendance/missed" className="underline underline-offset-2">
-            open the full missed list
-          </Link>{" "}
-          any time.
-        </div>
-      ) : null}
 
       {mobileOpen ? (
         <div className="fixed inset-0 z-40 md:hidden">
@@ -302,9 +334,6 @@ export function AppShell({
 
         <div className="flex min-w-0 flex-1 flex-col">
           <div className="flex-1">
-            {appRole === "teacher" && missedAttendance.length > 0 ? (
-              <MissedAttendanceBanner items={missedAttendance} />
-            ) : null}
             {children}
           </div>
           {footer}

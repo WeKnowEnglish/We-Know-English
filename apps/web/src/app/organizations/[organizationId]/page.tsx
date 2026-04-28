@@ -1,10 +1,13 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
+import { OrgDeleteClient } from "@/app/organizations/[organizationId]/org-delete-client";
 import { OrgDetailPendingClient } from "@/app/organizations/[organizationId]/org-detail-client";
+import { OrgMembersClient } from "@/app/organizations/[organizationId]/org-members-client";
 import { OrgScheduleTimezoneForm } from "@/app/organizations/[organizationId]/org-schedule-timezone-form";
 import {
-  fetchOrgMembershipRole,
   fetchOrganizationByIdForMember,
+  fetchOrganizationMembersForOrg,
+  fetchOrgMembershipRole,
   getPendingJoinRequestsForOrg,
 } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
@@ -28,7 +31,10 @@ export default async function OrganizationDetailPage({ params }: PageProps) {
     redirect("/organizations");
   }
 
-  const pending = role === "owner" ? await getPendingJoinRequestsForOrg(organizationId) : [];
+  const [pending, members] = await Promise.all([
+    role === "owner" ? getPendingJoinRequestsForOrg(organizationId) : Promise.resolve([]),
+    fetchOrganizationMembersForOrg(organizationId),
+  ]);
 
   const createdLabel = new Intl.DateTimeFormat(undefined, { dateStyle: "long" }).format(new Date(org.created_at));
 
@@ -56,6 +62,16 @@ export default async function OrganizationDetailPage({ params }: PageProps) {
       )}
 
       <section className="rounded-xl border border-border bg-card p-4">
+        <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Organization members</h2>
+        <OrgMembersClient
+          organizationId={organizationId}
+          viewerRole={role}
+          viewerProfileId={user.id}
+          initialMembers={members}
+        />
+      </section>
+
+      <section className="rounded-xl border border-border bg-card p-4">
         <h2 className="text-sm font-semibold uppercase tracking-wide text-muted-foreground">Teacher join requests</h2>
         {role === "owner" ? (
           <div className="mt-3">
@@ -72,6 +88,8 @@ export default async function OrganizationDetailPage({ params }: PageProps) {
           </p>
         )}
       </section>
+
+      {role === "owner" ? <OrgDeleteClient organizationId={organizationId} organizationName={org.name} /> : null}
     </main>
   );
 }

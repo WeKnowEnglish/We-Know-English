@@ -10,17 +10,26 @@ import { Separator } from "@/components/ui/separator";
 import { PasswordInput } from "@/components/password-input";
 import { claimStudentAccountsOnSignupAction } from "@/app/actions/tracker";
 
+function safeNextPath(next: string | null): string {
+  if (!next || !next.startsWith("/")) return "/";
+  if (next.startsWith("//") || next.includes("://")) return "/";
+  if (next === "/login" || next === "/signup") return "/";
+  return next;
+}
+
 export function LoginForm() {
   const router = useRouter();
   const searchParams = useSearchParams();
-  const next = searchParams.get("next") ?? "/";
+  const next = safeNextPath(searchParams.get("next"));
   const err = searchParams.get("error");
+  const reason = searchParams.get("reason");
 
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [message, setMessage] = useState<string | null>(() => {
     if (err === "auth") return "Could not confirm email link. Try again.";
     if (err === "config") return "Supabase environment variables are missing. See the banner above.";
+    if (reason === "idle") return "You were signed out after 10 minutes of inactivity.";
     return null;
   });
   const [loading, setLoading] = useState(false);
@@ -48,7 +57,8 @@ export function LoginForm() {
       return;
     }
     await claimStudentAccountsOnSignupAction();
-    router.push(next);
+    await supabase.auth.getSession();
+    router.replace(next);
     router.refresh();
   }
 

@@ -1,6 +1,5 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useEffect, useState, useTransition } from "react";
 import { approveJoinRequestAction, rejectJoinRequestAction } from "@/app/actions/organization";
 import type { PendingJoinRequestRow } from "@/lib/organization-server";
@@ -12,7 +11,6 @@ type OrgDetailClientProps = {
 };
 
 export function OrgDetailPendingClient({ initialPending }: OrgDetailClientProps) {
-  const router = useRouter();
   const [rows, setRows] = useState(initialPending);
   useEffect(() => {
     setRows(initialPending);
@@ -25,7 +23,6 @@ export function OrgDetailPendingClient({ initialPending }: OrgDetailClientProps)
   function afterSuccess() {
     setMessage(null);
     setIsError(false);
-    router.refresh();
   }
 
   function onApprove(requestId: string) {

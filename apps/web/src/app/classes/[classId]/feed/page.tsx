@@ -1,19 +1,17 @@
 import { notFound, redirect } from "next/navigation";
-import { ClassDetailClient } from "./class-detail-client";
+import { ClassFeedClient } from "./class-feed-client";
 import { fetchOrgMembershipRole, getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
-import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import {
   fetchAssignedClassIdsForTeacher,
-  fetchAttendanceSlotsForClass,
   fetchClassById,
-  fetchClassTeacherPanelData,
+  fetchClassFeedPosts,
   fetchEnrollmentsForOrg,
   fetchStudentsForOrg,
   teacherHasAccessToClass,
 } from "@/lib/tracker-queries";
 
-export default async function ClassDetailPage({ params }: { params: Promise<{ classId: string }> }) {
+export default async function ClassFeedPage({ params }: { params: Promise<{ classId: string }> }) {
   const { classId } = await params;
   const { user, appRole } = await getSession();
   if (!user || appRole !== "teacher") {
@@ -43,26 +41,23 @@ export default async function ClassDetailPage({ params }: { params: Promise<{ cl
 
   const scopedClassIds =
     orgRole === "owner" ? null : await fetchAssignedClassIdsForTeacher(orgId, user.id);
-
-  const [enrollments, attendanceSlots, teacherPanel, scheduleTimeZone] = await Promise.all([
-    fetchEnrollmentsForOrg(orgId, scopedClassIds),
-    fetchAttendanceSlotsForClass(orgId, classRoom),
-    fetchClassTeacherPanelData(orgId, classId, { userId: user.id, orgRole }),
-    getScheduleTimezoneForOrganization(orgId),
-  ]);
-  const visibleStudentIds = [...new Set(enrollments.map((row) => row.studentId))];
-  const students = await fetchStudentsForOrg(orgId, scopedClassIds ? visibleStudentIds : null);
+  const enrollments = await fetchEnrollmentsForOrg(orgId, scopedClassIds);
+  const classStudentIds = [...new Set(enrollments.filter((e) => e.classId === classId).map((e) => e.studentId))];
+  const students = await fetchStudentsForOrg(orgId, classStudentIds);
+  const { posts, error: feedError } = await fetchClassFeedPosts({
+    organizationId: orgId,
+    classId,
+    includeDrafts: true,
+  });
 
   return (
-    <ClassDetailClient
+    <ClassFeedClient
       organizationId={orgId}
-      scheduleTimeZone={scheduleTimeZone}
       classId={classId}
-      initialClassRoom={classRoom}
-      initialStudents={students}
-      initialEnrollments={enrollments}
-      initialAttendanceSlots={attendanceSlots}
-      initialTeacherPanel={teacherPanel}
+      className={classRoom.name}
+      students={students}
+      posts={posts}
+      feedError={feedError}
     />
   );
 }

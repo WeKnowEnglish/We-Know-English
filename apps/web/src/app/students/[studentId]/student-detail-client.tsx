@@ -156,9 +156,13 @@ export function StudentDetailClient({
         <CardContent className="flex flex-wrap gap-2">
           {enrolledClasses.length > 0 ? (
             enrolledClasses.map((classRoom) => (
-              <Badge key={classRoom.id} variant="secondary">
+              <Link
+                key={classRoom.id}
+                href={`/onboarding/${encodeURIComponent(classRoom.id)}`}
+                className="inline-flex items-center rounded-full border border-border bg-secondary px-2 py-0.5 text-xs font-medium text-secondary-foreground underline-offset-4 hover:underline"
+              >
                 {classRoom.name}
-              </Badge>
+              </Link>
             ))
           ) : (
             <p className="text-sm text-muted-foreground">No class enrollments yet.</p>
