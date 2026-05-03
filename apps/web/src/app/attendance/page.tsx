@@ -3,7 +3,7 @@ import { redirect } from "next/navigation";
 import { AttendanceClient } from "@/app/attendance/attendance-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import { isSessionUuid } from "@/lib/attendance-utils";
 import {
   fetchAttendancePriorityClasses,
@@ -27,10 +27,7 @@ export default async function AttendancePage({
   const reopenFromQuery =
     typeof sp.reopen === "string" && (sp.reopen === "1" || sp.reopen.toLowerCase() === "true");
 
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") {
-    redirect("/login");
-  }
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;
@@ -39,17 +36,16 @@ export default async function AttendancePage({
   }
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const [classes, students, enrollments, initialSessionBundle, priorityClasses, scheduleTimeZone] =
-    await Promise.all([
-      fetchClassesForOrg(orgId, access),
-      fetchStudentsForOrg(orgId),
-      fetchEnrollmentsForOrg(orgId),
-      sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
-        ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
-        : Promise.resolve(null),
-      fetchAttendancePriorityClasses(orgId, access),
-      getScheduleTimezoneForOrganization(orgId),
-    ]);
+  const [classes, students, enrollments, initialSessionBundle, scheduleTimeZone] = await Promise.all([
+    fetchClassesForOrg(orgId, access),
+    fetchStudentsForOrg(orgId),
+    fetchEnrollmentsForOrg(orgId),
+    sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
+      ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
+      : Promise.resolve(null),
+    getScheduleTimezoneForOrganization(orgId),
+  ]);
+  const priorityClasses = await fetchAttendancePriorityClasses(orgId, access, { classes, enrollments });
 
   return (
     <Suspense

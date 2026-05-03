@@ -77,13 +77,11 @@ export async function saveAttendanceBundleAction(params: {
     return { ok: false, error: typeof row?.error === "string" ? row.error : "Save failed" };
   }
 
+  /** Draft saves: invalidate attendance surfaces only; home/students/onboarding refresh on finalize. */
   revalidatePath("/attendance");
   revalidatePath("/attendance/report");
   revalidatePath("/attendance/missed");
   revalidatePath("/attendance/finalized-by-me");
-  revalidatePath("/onboarding");
-  revalidatePath("/students");
-  revalidatePath("/");
 
   return { ok: true, sessionId: row.session_id };
 }
@@ -110,6 +108,8 @@ export async function finalizeAttendanceSessionAction(params: {
   revalidatePath("/attendance/missed");
   revalidatePath("/attendance/finalized-by-me");
   revalidatePath("/onboarding");
+  revalidatePath("/students");
+  revalidatePath("/");
 
   return { ok: true };
 }
@@ -149,6 +149,8 @@ export async function reopenAttendanceSessionAction(params: {
   revalidatePath("/attendance/missed");
   revalidatePath("/attendance/finalized-by-me");
   revalidatePath("/onboarding");
+  revalidatePath("/students");
+  revalidatePath("/");
 
   return { ok: true };
 }

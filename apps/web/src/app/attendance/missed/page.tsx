@@ -1,23 +1,31 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import { buildAttendanceUrl } from "@/lib/attendance-utils";
-import { fetchMissedAttendanceOccurrences, resolveTeacherClassAccess } from "@/lib/tracker-queries";
+import {
+  fetchClassesForOrg,
+  fetchEnrollmentsForOrg,
+  fetchMissedAttendanceOccurrences,
+  resolveTeacherClassAccess,
+} from "@/lib/tracker-queries";
 import { buttonVariants } from "@/components/ui/button-variants";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
 
 export default async function MissedAttendancePage() {
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") redirect("/login");
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;
   if (!orgId) redirect("/onboarding");
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const items = await fetchMissedAttendanceOccurrences(orgId, access);
+  const [classes, enrollments] = await Promise.all([
+    fetchClassesForOrg(orgId, access),
+    fetchEnrollmentsForOrg(orgId),
+  ]);
+  const items = await fetchMissedAttendanceOccurrences(orgId, access, { classes, enrollments });
 
   return (
     <main className="mx-auto flex w-full max-w-2xl flex-1 flex-col gap-6 px-4 py-8">

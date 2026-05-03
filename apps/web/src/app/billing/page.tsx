@@ -3,8 +3,10 @@ import { BillingLedgerDemo } from "@/app/billing/billing-ledger-demo";
 import { buttonVariants } from "@/components/ui/button-variants";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { cn } from "@/lib/utils";
+import { getSession, requireTeacherSession } from "@/lib/session";
 
-export default function BillingPage() {
+export default async function BillingPage() {
+  requireTeacherSession(await getSession());
   return (
     <main className="mx-auto flex w-full max-w-4xl flex-1 flex-col gap-8 px-4 py-8">
       <div>

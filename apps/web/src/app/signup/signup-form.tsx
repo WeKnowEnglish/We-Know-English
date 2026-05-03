@@ -42,6 +42,7 @@ export function SignupForm() {
       options: {
         data: {
           full_name: fullName,
+          /** Mirrors `profiles.app_role` for middleware (`appRoleFromUser`) before RSC session runs. */
           app_role: appRole,
         },
         emailRedirectTo: typeof window !== "undefined" ? `${window.location.origin}/auth/callback` : undefined,

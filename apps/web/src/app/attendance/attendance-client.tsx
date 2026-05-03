@@ -131,6 +131,8 @@ export function AttendanceClient({
   const canAutosave = useRef(false);
   const attendanceRef = useRef(attendance);
   const lastPersistedSnapshotRef = useRef<string | null>(null);
+  const classRosterRef = useRef<Student[]>([]);
+  const persistToServerRef = useRef<() => Promise<boolean>>(async () => false);
 
   const activeClass = classes.find((c) => c.id === activeClassId) ?? null;
   const classRoster = useMemo(() => {
@@ -139,6 +141,7 @@ export function AttendanceClient({
     return students.filter((s) => ids.has(s.id));
   }, [activeClassId, enrollments, students]);
   attendanceRef.current = attendance;
+  classRosterRef.current = classRoster;
 
   const createDefaultAttendanceForClass = useCallback(
     (classId: string) => {
@@ -323,40 +326,76 @@ export function AttendanceClient({
   ]);
 
   const persistToServer = useCallback(async (): Promise<boolean> => {
-    if (!activeClassId || !sessionKey || !isSessionUuid(sessionKey) || !sessionDate) return false;
-    const at = attendanceRef.current;
-    const rows = classRoster.map((s) => ({
-      studentId: s.id,
-      status: at[s.id] ?? "present",
-    }));
-    const seq = ++saveSeq.current;
-    setSaveUi("saving");
-    setSaveMessage(null);
-    const res = await saveAttendanceBundleAction({
-      organizationId,
-      classId: activeClassId,
-      sessionId: sessionKey,
-      occurrenceKey: occurrenceKey || null,
-      sessionDate,
-      rows,
-    });
-    if (seq !== saveSeq.current) return false;
-    if (!res.ok) {
-      setSaveUi("error");
-      setSaveMessage(res.error);
-      return false;
+    const MAX_CHAINED_SAVES = 25;
+    let chains = 0;
+    while (chains++ < MAX_CHAINED_SAVES) {
+      const classId = activeClassId.trim();
+      const sk = sessionKey.trim();
+      const sd = sessionDate.trim();
+      if (!classId || !sk || !isSessionUuid(sk) || !sd) return false;
+
+      const roster = classRosterRef.current;
+      const rosterIds = roster.map((s) => s.id);
+      const snap = rosterAttendanceSnapshot(attendanceRef.current, rosterIds);
+      if (snap === lastPersistedSnapshotRef.current) return true;
+      if (rosterIds.length === 0) return false;
+
+      const at = attendanceRef.current;
+      const rows = roster.map((s) => ({
+        studentId: s.id,
+        status: at[s.id] ?? "present",
+      }));
+      const seq = ++saveSeq.current;
+      setSaveUi("saving");
+      setSaveMessage(null);
+      const res = await saveAttendanceBundleAction({
+        organizationId,
+        classId,
+        sessionId: sk,
+        occurrenceKey: occurrenceKey || null,
+        sessionDate: sd,
+        rows,
+      });
+      if (seq !== saveSeq.current) {
+        continue;
+      }
+      if (!res.ok) {
+        setSaveUi("error");
+        setSaveMessage(res.error);
+        return false;
+      }
+      lastPersistedSnapshotRef.current = rosterAttendanceSnapshot(attendanceRef.current, rosterIds);
+      setSaveUi("saved");
+      setTimeout(() => {
+        setSaveUi((u) => (u === "saved" ? "idle" : u));
+      }, 2500);
+
+      const snapAfter = rosterAttendanceSnapshot(attendanceRef.current, rosterIds);
+      if (snapAfter === lastPersistedSnapshotRef.current) {
+        return true;
+      }
     }
-    lastPersistedSnapshotRef.current = rosterAttendanceSnapshot(
-      attendanceRef.current,
-      classRoster.map((s) => s.id),
-    );
-    setSaveUi("saved");
-    setTimeout(() => {
-      setSaveUi((u) => (u === "saved" ? "idle" : u));
-    }, 2500);
-    router.refresh();
-    return true;
-  }, [organizationId, activeClassId, sessionKey, sessionDate, occurrenceKey, classRoster, router]);
+    setSaveUi("error");
+    setSaveMessage("Save could not finish—please try Save again.");
+    return false;
+  }, [organizationId, activeClassId, sessionKey, sessionDate, occurrenceKey]);
+
+  persistToServerRef.current = persistToServer;
+
+  useEffect(() => {
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") void persistToServerRef.current();
+    };
+    const onPageHide = () => {
+      void persistToServerRef.current();
+    };
+    document.addEventListener("visibilitychange", onVisibility);
+    window.addEventListener("pagehide", onPageHide);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibility);
+      window.removeEventListener("pagehide", onPageHide);
+    };
+  }, []);
 
   useEffect(() => {
     if (!canAutosave.current || finalized) return;

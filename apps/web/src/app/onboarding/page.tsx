@@ -1,16 +1,17 @@
-import { redirect } from "next/navigation";
 import { CreateOrganizationForm } from "@/components/create-organization-form";
 import { ClassesClient } from "@/app/onboarding/classes-client";
 import { MissedAttendanceBanner } from "@/components/missed-attendance-banner";
-import { fetchClassesForOrg, fetchMissedAttendanceOccurrences, resolveTeacherClassAccess } from "@/lib/tracker-queries";
+import {
+  fetchClassesForOrg,
+  fetchEnrollmentsForOrg,
+  fetchMissedAttendanceOccurrences,
+  resolveTeacherClassAccess,
+} from "@/lib/tracker-queries";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 
 export default async function OnboardingClassesPage() {
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") {
-    redirect("/login");
-  }
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   if (orgCtx.organizations.length === 0) {
@@ -23,8 +24,14 @@ export default async function OnboardingClassesPage() {
   }
 
   const access = await resolveTeacherClassAccess(user.id, activeId);
-  const classes = await fetchClassesForOrg(activeId, access);
-  const missedAttendance = await fetchMissedAttendanceOccurrences(activeId, access);
+  const [classes, enrollments] = await Promise.all([
+    fetchClassesForOrg(activeId, access),
+    fetchEnrollmentsForOrg(activeId),
+  ]);
+  const missedAttendance = await fetchMissedAttendanceOccurrences(activeId, access, {
+    classes,
+    enrollments,
+  });
   return (
     <>
       {missedAttendance.length > 0 ? <MissedAttendanceBanner items={missedAttendance} /> : null}

@@ -1,6 +1,6 @@
 import { createServerClient } from "@supabase/ssr";
 import { type NextRequest, NextResponse } from "next/server";
-import { isTeacherRoute } from "@/lib/auth";
+import { appRoleFromUser, isTeacherRoute } from "@/lib/auth";
 import { getEnv, isSupabaseConfigured } from "@/lib/env";
 
 function isPublicPath(pathname: string) {
@@ -80,18 +80,8 @@ export async function middleware(request: NextRequest) {
   }
 
   if (user && !isPublicPath(pathname)) {
-    await supabase.rpc("ensure_my_profile");
-
-    const { data: profile } = await supabase.from("profiles").select("app_role").eq("id", user.id).maybeSingle();
-
-    const meta = user.user_metadata?.app_role;
-    const appRole =
-      profile?.app_role === "teacher" || profile?.app_role === "student"
-        ? profile.app_role
-        : meta === "teacher" || meta === "student"
-          ? meta
-          : "teacher";
-
+    /** Edge path: JWT metadata only; `getSession()` loads canonical role from `profiles`. */
+    const appRole = appRoleFromUser(user) ?? "teacher";
     if (appRole === "student" && isTeacherRoute(pathname)) {
       const url = request.nextUrl.clone();
       url.pathname = "/";

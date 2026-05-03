@@ -1,5 +1,6 @@
 import type { User } from "@supabase/supabase-js";
 import { cache } from "react";
+import { redirect } from "next/navigation";
 import type { AppRole } from "@/lib/auth";
 import { parseAppRole } from "@/lib/auth";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
@@ -53,3 +54,15 @@ export const getSession = cache(async function getSession(): Promise<SessionInfo
 
   return { user, appRole };
 });
+
+/**
+ * Teacher-only RSC entry: unauthenticated users → login; students → home.
+ * Returns narrowed session for type-safe `user.id` after the call.
+ */
+export function requireTeacherSession(session: SessionInfo): { user: User; appRole: "teacher" } {
+  const { user, appRole } = session;
+  if (!user) redirect("/login");
+  if (appRole === "student") redirect("/");
+  if (appRole !== "teacher") redirect("/login");
+  return { user, appRole: "teacher" };
+}
