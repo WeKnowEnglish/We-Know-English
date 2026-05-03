@@ -1,5 +1,4 @@
 import Link from "next/link";
-import { redirect } from "next/navigation";
 import { OrganizationsClient } from "@/app/organizations/organizations-client";
 import { CreateOrganizationForm } from "@/components/create-organization-form";
 import {
@@ -7,13 +6,10 @@ import {
   fetchTeacherOrganizationsWithRoles,
   getOrganizationShellContext,
 } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 
 export default async function OrganizationsPage() {
-  const { appRole, user } = await getSession();
-  if (!user || appRole === "student") {
-    redirect("/");
-  }
+  const { appRole, user } = requireTeacherSession(await getSession());
 
   const ctx = await getOrganizationShellContext({ userId: user.id, appRole: "teacher" });
   const myOrgsWithRoles = await fetchTeacherOrganizationsWithRoles(user.id);

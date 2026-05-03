@@ -21,7 +21,7 @@ import type { AttendanceStatus, ClassFeedPost, ClassRoom, Student, StudentClassE
 export async function verifyOrgMembership(userId: string, organizationId: string): Promise<boolean> {
   const supabase = await createServerSupabaseClient();
   if (!supabase) return false;
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("organization_members")
     .select("id")
     .eq("profile_id", userId)
@@ -34,6 +34,12 @@ export async function verifyOrgMembership(userId: string, organizationId: string
 export type TeacherClassAccess = {
   userId: string;
   orgRole: "owner" | "staff" | "client";
+};
+
+/** When callers already loaded classes + enrollments, pass through to avoid duplicate queries. */
+export type AttendanceSchedulePreload = {
+  classes: ClassRoom[];
+  enrollments: StudentClassEnrollment[];
 };
 
 /** Build access for `fetchClassesForOrg` from org membership (owners and staff get scoped lists). */
@@ -744,11 +750,10 @@ export async function fetchAttendanceClassSummaryForOrg(params: {
       ? (clsRow as { name: string }).name
       : "Class";
 
-  const [enrollments, students] = await Promise.all([
-    fetchEnrollmentsForOrg(params.organizationId),
-    fetchStudentsForOrg(params.organizationId),
-  ]);
-  const rosterIds = enrollments.filter((e) => e.classId === params.classId).map((e) => e.studentId);
+  const enrollments = await fetchEnrollmentsForOrg(params.organizationId, [params.classId]);
+  const rosterIds = [...new Set(enrollments.map((e) => e.studentId))];
+  const students =
+    rosterIds.length > 0 ? await fetchStudentsForOrg(params.organizationId, rosterIds) : [];
   const studentNameById = new Map(students.map((s) => [s.id, s.fullName]));
 
   type Counts = { present: number; late: number; absentExcused: number; absentUnexcused: number };
@@ -861,14 +866,18 @@ export async function fetchAttendanceHistoryForStudent(
 
   const dateFrom = params?.dateFrom ?? subDays(new Date(), 90).toISOString().slice(0, 10);
   const dateTo = params?.dateTo ?? addDays(new Date(), 1).toISOString().slice(0, 10);
+  const widenFrom = format(subDays(new Date(`${dateFrom}T12:00:00`), 3), "yyyy-MM-dd");
+  const widenTo = format(addDays(new Date(`${dateTo}T12:00:00`), 3), "yyyy-MM-dd");
 
   const { data: records, error } = await supabase
     .from("attendance_records")
     .select(
-      "id, status, marked_at, marked_by, sessions(session_date, attendance_finalized, classes(name))",
+      "id, status, marked_at, marked_by, sessions!inner(session_date, attendance_finalized, occurrence_key, classes(name))",
     )
     .eq("organization_id", organizationId)
-    .eq("student_id", studentId);
+    .eq("student_id", studentId)
+    .gte("sessions.session_date", widenFrom)
+    .lte("sessions.session_date", widenTo);
 
   if (error || !records?.length) return [];
 
@@ -899,11 +908,13 @@ export async function fetchAttendanceHistoryForStudent(
         | {
             session_date: string;
             attendance_finalized: boolean;
+            occurrence_key: string | null;
             classes: { name: string } | { name: string }[] | null;
           }
         | {
             session_date: string;
             attendance_finalized: boolean;
+            occurrence_key: string | null;
             classes: { name: string } | { name: string }[] | null;
           }[]
         | null;
@@ -911,8 +922,21 @@ export async function fetchAttendanceHistoryForStudent(
     const sRaw = r.sessions;
     const s = Array.isArray(sRaw) ? sRaw[0] : sRaw;
     if (!s) continue;
-    const sessionDate = String(s.session_date).slice(0, 10);
-    if (sessionDate < dateFrom || sessionDate > dateTo) continue;
+    if (
+      !sessionQualifiesForReportDateRange(
+        {
+          session_date: s.session_date,
+          occurrence_key: s.occurrence_key ?? null,
+        },
+        dateFrom,
+        dateTo,
+      )
+    )
+      continue;
+    const sessionDate = reportSessionDateForDisplay({
+      session_date: s.session_date,
+      occurrence_key: s.occurrence_key ?? null,
+    });
     const cls = s.classes;
     const className =
       cls && !Array.isArray(cls) ? cls.name : Array.isArray(cls) && cls[0] ? cls[0].name : "Class";
@@ -941,9 +965,12 @@ export type MissedAttendanceItem = {
 export async function fetchMissedAttendanceOccurrences(
   organizationId: string,
   access: TeacherClassAccess | null = null,
+  preloaded: AttendanceSchedulePreload | null = null,
 ): Promise<MissedAttendanceItem[]> {
-  const classes = await fetchClassesForOrg(organizationId, access);
-  const enrollments = await fetchEnrollmentsForOrg(organizationId);
+  const classes =
+    preloaded?.classes ?? (await fetchClassesForOrg(organizationId, access));
+  const enrollments =
+    preloaded?.enrollments ?? (await fetchEnrollmentsForOrg(organizationId));
   const classIdsWithStudents = new Set(
     enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
   );
@@ -1008,23 +1035,37 @@ export async function fetchMissedAttendanceOccurrences(
   if (supabase) {
     const cutoffStr = format(subDays(now, 60), "yyyy-MM-dd");
     const todayStr = format(now, "yyyy-MM-dd");
-    const teachableIds = new Set(teachable.map((c) => c.id));
-    const { data: dbRows } = await supabase
-      .from("sessions")
-      .select("occurrence_key, session_date, class_id, classes(name)")
-      .eq("organization_id", organizationId)
-      .eq("attendance_finalized", false)
-      .lte("session_date", todayStr)
-      .gte("session_date", cutoffStr);
+    const teachableClassIds = teachable.map((c) => c.id);
+    const teachableClassIdSet = new Set(teachableClassIds);
+    type DbRowRaw = {
+      occurrence_key: string | null;
+      session_date: string;
+      class_id: string;
+      classes: { name: string } | { name: string }[] | null;
+    };
+    const classChunk = 120;
+    const dbRowsAccum: DbRowRaw[] = [];
 
-    for (const raw of dbRows ?? []) {
-      const row = raw as {
-        occurrence_key: string | null;
-        session_date: string;
-        class_id: string;
-        classes: { name: string } | { name: string }[] | null;
-      };
-      if (!teachableIds.has(row.class_id)) continue;
+    if (teachableClassIds.length === 0) {
+      // no teachable classes — skip DB merge
+    } else {
+      for (let c = 0; c < teachableClassIds.length; c += classChunk) {
+        const slice = teachableClassIds.slice(c, c + classChunk);
+        const { data: dbRows } = await supabase
+          .from("sessions")
+          .select("occurrence_key, session_date, class_id, classes(name)")
+          .eq("organization_id", organizationId)
+          .eq("attendance_finalized", false)
+          .lte("session_date", todayStr)
+          .gte("session_date", cutoffStr)
+          .in("class_id", slice);
+
+        if (dbRows?.length) dbRowsAccum.push(...(dbRows as DbRowRaw[]));
+      }
+    }
+
+    for (const row of dbRowsAccum) {
+      if (!teachableClassIdSet.has(row.class_id)) continue;
       const classRoom = teachableById.get(row.class_id);
       if (!classRoom || !classHasDefinedSchedule(classRoom)) continue;
 
@@ -1102,9 +1143,12 @@ function betterAttendancePriority(
 export async function fetchAttendancePriorityClasses(
   organizationId: string,
   access: TeacherClassAccess | null = null,
+  preloaded: AttendanceSchedulePreload | null = null,
 ): Promise<AttendancePriorityRow[]> {
-  const classes = await fetchClassesForOrg(organizationId, access);
-  const enrollments = await fetchEnrollmentsForOrg(organizationId);
+  const classes =
+    preloaded?.classes ?? (await fetchClassesForOrg(organizationId, access));
+  const enrollments =
+    preloaded?.enrollments ?? (await fetchEnrollmentsForOrg(organizationId));
   const classIdsWithStudents = new Set(
     enrollments.filter((e) => classes.some((c) => c.id === e.classId)).map((e) => e.classId),
   );

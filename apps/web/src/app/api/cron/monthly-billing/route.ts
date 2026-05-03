@@ -3,12 +3,25 @@ import { runMonthlyStripeInvoices } from "@/app/actions/billing";
 
 /**
  * Schedule with Vercel Cron (1st of month) or external scheduler.
- * Protect with CRON_SECRET in Authorization header.
+ * Production: `CRON_SECRET` must be set; request must send `Authorization: Bearer <CRON_SECRET>`.
+ * Development: if `CRON_SECRET` is unset, the route is callable without auth (local only).
  */
 export async function GET(request: Request) {
-  const secret = process.env.CRON_SECRET;
+  const secret = process.env.CRON_SECRET?.trim() ?? "";
   const auth = request.headers.get("authorization");
-  if (secret && auth !== `Bearer ${secret}`) {
+  const isProd = process.env.NODE_ENV === "production";
+
+  if (isProd) {
+    if (!secret) {
+      return NextResponse.json(
+        { error: "Cron misconfiguration: set CRON_SECRET in production" },
+        { status: 503 },
+      );
+    }
+    if (auth !== `Bearer ${secret}`) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
+    }
+  } else if (secret && auth !== `Bearer ${secret}`) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 

@@ -1,3 +1,4 @@
+import { cache } from "react";
 import { cookies } from "next/headers";
 import type { AppRole } from "@/lib/auth";
 import { WKE_ACTIVE_ORG_COOKIE } from "@/lib/active-org-cookie";
@@ -32,11 +33,11 @@ export type OrganizationShellContext = {
   headerTitle: string;
 };
 
-export async function getOrganizationShellContext(params: {
-  userId: string | null;
-  appRole: AppRole | null;
-}): Promise<OrganizationShellContext> {
-  if (!params.userId || params.appRole === "student") {
+const getOrganizationShellContextCached = cache(async function getOrganizationShellContextCached(
+  userId: string | null,
+  appRole: AppRole | null,
+): Promise<OrganizationShellContext> {
+  if (!userId || appRole === "student") {
     return {
       organizations: [],
       activeOrganizationId: null,
@@ -64,7 +65,7 @@ export async function getOrganizationShellContext(params: {
   const { data: rows, error } = await supabase
     .from("organization_members")
     .select("organization_id, organizations ( id, name, schedule_timezone )")
-    .eq("profile_id", params.userId);
+    .eq("profile_id", userId);
 
   if (error || !rows?.length) {
     return {
@@ -96,7 +97,7 @@ export async function getOrganizationShellContext(params: {
   const { data: profileRow } = await supabase
     .from("profiles")
     .select("last_active_organization_id")
-    .eq("id", params.userId)
+    .eq("id", userId)
     .maybeSingle();
 
   const cookieStore = await cookies();
@@ -118,6 +119,13 @@ export async function getOrganizationShellContext(params: {
     activeOrganizationId: activeId,
     headerTitle,
   };
+});
+
+export function getOrganizationShellContext(params: {
+  userId: string | null;
+  appRole: AppRole | null;
+}): Promise<OrganizationShellContext> {
+  return getOrganizationShellContextCached(params.userId, params.appRole);
 }
 
 /** Teacher's organizations with membership role (for directory links). */

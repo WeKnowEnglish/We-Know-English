@@ -9,6 +9,7 @@ import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getSession } from "@/lib/session";
 import {
   fetchClassesForOrg,
+  fetchEnrollmentsForOrg,
   fetchMissedAttendanceOccurrences,
   fetchStudentEnrollmentClasses,
   resolveTeacherClassAccess,
@@ -54,9 +55,15 @@ export default async function Home() {
     const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole: "teacher" });
     if (orgCtx.activeOrganizationId) {
       const access = await resolveTeacherClassAccess(user.id, orgCtx.activeOrganizationId);
-      const all = await fetchClassesForOrg(orgCtx.activeOrganizationId, access);
-      missedAttendance = await fetchMissedAttendanceOccurrences(orgCtx.activeOrganizationId, access);
-      recentClasses = [...all]
+      const [classes, enrollments] = await Promise.all([
+        fetchClassesForOrg(orgCtx.activeOrganizationId, access),
+        fetchEnrollmentsForOrg(orgCtx.activeOrganizationId),
+      ]);
+      missedAttendance = await fetchMissedAttendanceOccurrences(orgCtx.activeOrganizationId, access, {
+        classes,
+        enrollments,
+      });
+      recentClasses = [...classes]
         .sort((a, b) => +new Date(b.updatedAt) - +new Date(a.updatedAt))
         .slice(0, 3);
     }

@@ -1,7 +1,7 @@
 import Link from "next/link";
 import { redirect } from "next/navigation";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import { buildAttendanceUrl } from "@/lib/attendance-utils";
 import { fetchFinalizedSessionsMarkedByProfile } from "@/lib/tracker-queries";
 import { buttonVariants } from "@/components/ui/button-variants";
@@ -9,8 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { cn } from "@/lib/utils";
 
 export default async function FinalizedByMePage() {
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") redirect("/login");
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;

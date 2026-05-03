@@ -1,7 +1,7 @@
 import { notFound, redirect } from "next/navigation";
 import { StudentDetailClient } from "./student-detail-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import {
   fetchAttendanceHistoryForStudent,
   fetchClassesForOrg,
@@ -12,10 +12,7 @@ import {
 
 export default async function StudentTeacherViewPage({ params }: { params: Promise<{ studentId: string }> }) {
   const { studentId } = await params;
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") {
-    redirect("/login");
-  }
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;

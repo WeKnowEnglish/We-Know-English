@@ -10,16 +10,13 @@ import {
   fetchOrgMembershipRole,
   getPendingJoinRequestsForOrg,
 } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 
 type PageProps = { params: Promise<{ organizationId: string }> };
 
 export default async function OrganizationDetailPage({ params }: PageProps) {
   const { organizationId } = await params;
-  const { appRole, user } = await getSession();
-  if (!user || appRole === "student") {
-    redirect("/");
-  }
+  const { appRole, user } = requireTeacherSession(await getSession());
 
   const org = await fetchOrganizationByIdForMember(organizationId, user.id);
   if (!org) {

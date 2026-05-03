@@ -9,7 +9,7 @@
 
 ## Development
 
-1. Copy `.env.example` to `.env.local` and set Supabase, Stripe, and optional `CRON_SECRET`.
+1. Copy [`.env.example`](.env.example) to `.env.local` and set Supabase and Stripe. Set **`CRON_SECRET` in production** (required for `/api/cron/monthly-billing`).
 2. Install dependencies:
 
 ```bash
@@ -45,7 +45,7 @@ Open [http://localhost:3000](http://localhost:3000). You will be redirected to `
 | `/feed` | Quick tags → 3-sentence narrative |
 | `/billing` | Family ledger demo |
 | `/billing/monthly` | Monthly Stripe invoice server action |
-| `GET /api/cron/monthly-billing?organizationId=…` | Cron hook (protect with `Authorization: Bearer CRON_SECRET`) |
+| `GET /api/cron/monthly-billing?organizationId=…` | Cron hook — **production** requires `CRON_SECRET` and `Authorization: Bearer <CRON_SECRET>` |
 
 ## Supabase
 
@@ -60,3 +60,7 @@ Open [http://localhost:3000](http://localhost:3000). You will be redirected to `
 npm run lint
 npm run build
 ```
+
+### Pre-deploy smoke (manual)
+
+After attendance performance work, spot-check: rapid attendance marking (no reverts); draft-only saves vs home/missed banners (expect refresh after **Finalize**); student profile attendance history around date boundaries; `/api/cron/monthly-billing` returns 401/503 without a valid bearer in production.

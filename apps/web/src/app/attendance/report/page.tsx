@@ -2,7 +2,7 @@ import { redirect } from "next/navigation";
 import { subDays } from "date-fns";
 import { AttendanceReportClient } from "@/app/attendance/report/attendance-report-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import {
   fetchAttendanceClassSummaryForOrg,
   fetchAttendanceReportForOrg,
@@ -16,8 +16,7 @@ export default async function AttendanceReportPage({
   searchParams: Promise<Record<string, string | string[] | undefined>>;
 }) {
   const sp = await searchParams;
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") redirect("/login");
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;

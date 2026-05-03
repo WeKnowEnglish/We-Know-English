@@ -1,7 +1,7 @@
 import { redirect } from "next/navigation";
 import { StudentsClient } from "@/app/students/students-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
-import { getSession } from "@/lib/session";
+import { getSession, requireTeacherSession } from "@/lib/session";
 import {
   fetchAssignedClassIdsForTeacher,
   fetchClassesForOrg,
@@ -11,10 +11,7 @@ import {
 } from "@/lib/tracker-queries";
 
 export default async function StudentsManagementPage() {
-  const { user, appRole } = await getSession();
-  if (!user || appRole !== "teacher") {
-    redirect("/login");
-  }
+  const { user, appRole } = requireTeacherSession(await getSession());
 
   const orgCtx = await getOrganizationShellContext({ userId: user.id, appRole });
   const orgId = orgCtx.activeOrganizationId;
