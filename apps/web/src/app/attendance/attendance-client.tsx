@@ -10,6 +10,7 @@ import {
   reopenAttendanceSessionAction,
   saveAttendanceBundleAction,
   ensureAttendanceSessionAction,
+  fetchClassRosterStudentsAction,
 } from "@/app/actions/attendance";
 import {
   ATTENDANCE_STATUS_CYCLE,
@@ -57,6 +58,25 @@ const sessionDateOnlyFormatter = new Intl.DateTimeFormat("en-US", {
   day: "numeric",
   year: "numeric",
 });
+
+function mergeStudentRows(prev: Student[], additions: Student[]): Student[] {
+  const m = new Map(prev.map((s) => [s.id, s]));
+  for (const s of additions) m.set(s.id, s);
+  return [...m.values()];
+}
+
+function defaultAttendanceForClassFromStudents(
+  classId: string,
+  rosterStudents: Student[],
+  enrollments: StudentClassEnrollment[],
+): Record<string, AttendanceStatus> {
+  const allowed = new Set(enrollments.filter((e) => e.classId === classId).map((e) => e.studentId));
+  const next: Record<string, AttendanceStatus> = {};
+  for (const s of rosterStudents) {
+    if (allowed.has(s.id)) next[s.id] = "present";
+  }
+  return next;
+}
 
 function priorityKindLabel(kind: AttendancePriorityRow["kind"]): string {
   switch (kind) {
@@ -144,14 +164,7 @@ export function AttendanceClient({
   classRosterRef.current = classRoster;
 
   const createDefaultAttendanceForClass = useCallback(
-    (classId: string) => {
-      const ids = new Set(enrollments.filter((e) => e.classId === classId).map((e) => e.studentId));
-      const next: Record<string, AttendanceStatus> = {};
-      for (const s of students) {
-        if (ids.has(s.id)) next[s.id] = "present";
-      }
-      return next;
-    },
+    (classId: string) => defaultAttendanceForClassFromStudents(classId, students, enrollments),
     [enrollments, students],
   );
 
@@ -436,13 +449,22 @@ export function AttendanceClient({
 
     if (resolvedPreset) {
       const { occurrenceKey: key, sessionDate: sd } = resolvedPreset;
-      const defaults = createDefaultAttendanceForClass(classId);
       setActiveClassId(classId);
       setOccurrenceKey(key);
       setSessionDate(sd);
-      setAttendance(defaults);
       setFinalized(false);
+      setAttendance(EMPTY_ATTENDANCE);
       startTransition(async () => {
+        const rosterRes = await fetchClassRosterStudentsAction({ organizationId, classId });
+        if (!rosterRes.ok) {
+          setSaveMessage(rosterRes.error);
+          setSaveUi("error");
+          return;
+        }
+        const merged = mergeStudentRows(students, rosterRes.students);
+        setStudents(merged);
+        const defaults = defaultAttendanceForClassFromStudents(classId, merged, enrollments);
+        setAttendance(defaults);
         const res = await saveAttendanceBundleAction({
           organizationId,
           classId,
@@ -472,14 +494,23 @@ export function AttendanceClient({
     const classRoom = classes.find((c) => c.id === classId);
     const occ = classRoom ? pickPrimaryAttendanceOccurrence(classRoom, { scheduleTimeZone }) : null;
     if (!classRoom || !occ) {
-      const defaults = createDefaultAttendanceForClass(classId);
       const sd = new Date().toISOString().slice(0, 10);
       setActiveClassId(classId);
       setSessionDate(sd);
       setOccurrenceKey("");
-      setAttendance(defaults);
       setFinalized(false);
+      setAttendance(EMPTY_ATTENDANCE);
       startTransition(async () => {
+        const rosterRes = await fetchClassRosterStudentsAction({ organizationId, classId });
+        if (!rosterRes.ok) {
+          setSaveMessage(rosterRes.error);
+          setSaveUi("error");
+          return;
+        }
+        const merged = mergeStudentRows(students, rosterRes.students);
+        setStudents(merged);
+        const defaults = defaultAttendanceForClassFromStudents(classId, merged, enrollments);
+        setAttendance(defaults);
         const res = await saveAttendanceBundleAction({
           organizationId,
           classId,
@@ -507,13 +538,22 @@ export function AttendanceClient({
     }
     const key = buildOccurrenceKey(occ.classId, occ.slotId, occ.startsAt);
     const sd = sessionDateFromScheduleInstant(occ.startsAt, scheduleTimeZone);
-    const defaults = createDefaultAttendanceForClass(classId);
     setActiveClassId(classId);
     setOccurrenceKey(key);
     setSessionDate(sd);
-    setAttendance(defaults);
     setFinalized(false);
+    setAttendance(EMPTY_ATTENDANCE);
     startTransition(async () => {
+      const rosterRes = await fetchClassRosterStudentsAction({ organizationId, classId });
+      if (!rosterRes.ok) {
+        setSaveMessage(rosterRes.error);
+        setSaveUi("error");
+        return;
+      }
+      const merged = mergeStudentRows(students, rosterRes.students);
+      setStudents(merged);
+      const defaults = defaultAttendanceForClassFromStudents(classId, merged, enrollments);
+      setAttendance(defaults);
       const res = await saveAttendanceBundleAction({
         organizationId,
         classId,

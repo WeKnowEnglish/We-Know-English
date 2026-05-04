@@ -2,8 +2,15 @@
 
 import { revalidatePath } from "next/cache";
 import { createServerSupabaseClient } from "@/lib/supabase/server";
-import { fetchAttendanceOccurrenceStatusMap, verifyOrgMembership } from "@/lib/tracker-queries";
-import type { AttendanceStatus } from "@/lib/tracker-types";
+import { fetchOrgMembershipRole } from "@/lib/organization-server";
+import {
+  fetchAttendanceOccurrenceStatusMap,
+  fetchEnrollmentsForOrg,
+  fetchStudentsForOrg,
+  teacherHasAccessToClass,
+  verifyOrgMembership,
+} from "@/lib/tracker-queries";
+import type { AttendanceStatus, Student } from "@/lib/tracker-types";
 
 type ClassAttendanceRole = "lead" | "co_teacher" | "assistant" | "none";
 
@@ -44,6 +51,31 @@ async function resolveClassAttendanceRole(
   const role = (ct as { role?: string } | null)?.role;
   if (role === "co_teacher" || role === "assistant") return role;
   return "none";
+}
+
+/** Lazy roster load: enrolled student rows for one class only (JWT + teacher access guarded). */
+export async function fetchClassRosterStudentsAction(params: {
+  organizationId: string;
+  classId: string;
+}): Promise<{ ok: true; students: Student[] } | { ok: false; error: string }> {
+  const ctx = await requireTeacherOrg(params.organizationId);
+  if (!ctx.ok || !ctx.supabase || !ctx.userId) return { ok: false, error: "Unauthorized" };
+
+  const orgRole = await fetchOrgMembershipRole(ctx.userId, params.organizationId);
+  const allowed = await teacherHasAccessToClass(
+    params.organizationId,
+    ctx.userId,
+    orgRole ?? "staff",
+    params.classId,
+  );
+  if (!allowed) return { ok: false, error: "Not allowed for this class" };
+
+  const enrollments = await fetchEnrollmentsForOrg(params.organizationId, [params.classId]);
+  const ids = [...new Set(enrollments.map((e) => e.studentId))];
+  if (ids.length === 0) return { ok: true, students: [] };
+
+  const students = await fetchStudentsForOrg(params.organizationId, ids);
+  return { ok: true, students };
 }
 
 export async function saveAttendanceBundleAction(params: {

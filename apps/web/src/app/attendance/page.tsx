@@ -1,6 +1,5 @@
-import { Suspense } from "react";
+import dynamic from "next/dynamic";
 import { redirect } from "next/navigation";
-import { AttendanceClient } from "@/app/attendance/attendance-client";
 import { getOrganizationShellContext } from "@/lib/organization-server";
 import { getScheduleTimezoneForOrganization } from "@/lib/organization-schedule-timezone";
 import { getSession, requireTeacherSession } from "@/lib/session";
@@ -8,11 +7,19 @@ import { isSessionUuid } from "@/lib/attendance-utils";
 import {
   fetchAttendancePriorityClasses,
   fetchAttendanceSessionBundle,
+  fetchAttendanceSessionRosterStudents,
   fetchClassesForOrg,
   fetchEnrollmentsForOrg,
-  fetchStudentsForOrg,
   resolveTeacherClassAccess,
 } from "@/lib/tracker-queries";
+
+const AttendanceClient = dynamic(() => import("./attendance-client").then((m) => m.AttendanceClient), {
+  loading: () => (
+    <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-16">
+      <p className="text-sm text-muted-foreground">Loading attendance…</p>
+    </main>
+  ),
+});
 
 export default async function AttendancePage({
   searchParams,
@@ -36,39 +43,42 @@ export default async function AttendancePage({
   }
 
   const access = await resolveTeacherClassAccess(user.id, orgId);
-  const [classes, students, enrollments, initialSessionBundle, scheduleTimeZone] = await Promise.all([
-    fetchClassesForOrg(orgId, access),
-    fetchStudentsForOrg(orgId),
-    fetchEnrollmentsForOrg(orgId),
-    sessionIdFromQuery && isSessionUuid(sessionIdFromQuery)
-      ? fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
-      : Promise.resolve(null),
+  const hasSessionUuid = Boolean(sessionIdFromQuery && isSessionUuid(sessionIdFromQuery));
+
+  const classes = await fetchClassesForOrg(orgId, access);
+  const classIds = classes.map((c) => c.id);
+  const enrollments =
+    classIds.length === 0 ? [] : await fetchEnrollmentsForOrg(orgId, classIds);
+
+  const initialSessionBundle =
+    hasSessionUuid && sessionIdFromQuery
+      ? await fetchAttendanceSessionBundle(orgId, sessionIdFromQuery)
+      : null;
+
+  const rosterStudentsPromise = initialSessionBundle
+    ? fetchAttendanceSessionRosterStudents(orgId, initialSessionBundle, enrollments)
+    : Promise.resolve([]);
+
+  const [scheduleTimeZone, priorityClasses, initialStudents] = await Promise.all([
     getScheduleTimezoneForOrganization(orgId),
+    fetchAttendancePriorityClasses(orgId, access, { classes, enrollments }),
+    rosterStudentsPromise,
   ]);
-  const priorityClasses = await fetchAttendancePriorityClasses(orgId, access, { classes, enrollments });
 
   return (
-    <Suspense
-      fallback={
-        <main className="mx-auto flex w-full max-w-5xl flex-1 flex-col px-4 py-16">
-          <p className="text-sm text-muted-foreground">Loading attendance…</p>
-        </main>
-      }
-    >
-      <AttendanceClient
-        organizationId={orgId}
-        scheduleTimeZone={scheduleTimeZone}
-        initialClasses={classes}
-        initialStudents={students}
-        initialEnrollments={enrollments}
-        priorityClasses={priorityClasses}
-        initialSessionBundle={initialSessionBundle}
-        classIdFromQuery={classIdFromQuery}
-        sessionIdFromQuery={sessionIdFromQuery}
-        occurrenceKeyFromQuery={occurrenceKeyFromQuery}
-        sessionDateFromQuery={sessionDateFromQuery}
-        reopenFromQuery={reopenFromQuery}
-      />
-    </Suspense>
+    <AttendanceClient
+      organizationId={orgId}
+      scheduleTimeZone={scheduleTimeZone}
+      initialClasses={classes}
+      initialStudents={initialStudents}
+      initialEnrollments={enrollments}
+      priorityClasses={priorityClasses}
+      initialSessionBundle={initialSessionBundle}
+      classIdFromQuery={classIdFromQuery}
+      sessionIdFromQuery={sessionIdFromQuery}
+      occurrenceKeyFromQuery={occurrenceKeyFromQuery}
+      sessionDateFromQuery={sessionDateFromQuery}
+      reopenFromQuery={reopenFromQuery}
+    />
   );
 }
