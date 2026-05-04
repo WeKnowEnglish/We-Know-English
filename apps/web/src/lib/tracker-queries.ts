@@ -385,6 +385,19 @@ export async function fetchAttendanceSessionBundle(
   };
 }
 
+/** Student roster rows needed to render a persisted session — scoped fetch, no org-wide roster. */
+export async function fetchAttendanceSessionRosterStudents(
+  organizationId: string,
+  bundle: AttendanceSessionBundle,
+  enrollments: StudentClassEnrollment[],
+): Promise<Student[]> {
+  const cid = bundle.classId;
+  const fromEnrollment = enrollments.filter((e) => e.classId === cid).map((e) => e.studentId);
+  const ids = [...new Set([...Object.keys(bundle.attendance), ...fromEnrollment])];
+  if (ids.length === 0) return [];
+  return fetchStudentsForOrg(organizationId, ids);
+}
+
 /** Distinct finalized sessions where at least one attendance row was last saved by this profile. */
 export type FinalizedSessionMarkedByMeRow = {
   sessionId: string;

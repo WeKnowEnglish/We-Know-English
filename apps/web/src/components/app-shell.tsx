@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import {
   Building2,
@@ -84,6 +84,7 @@ function SidebarLink({
   return (
     <Link
       href={item.href}
+      prefetch
       onClick={onClick}
       title={item.label}
       className={cn(
@@ -108,6 +109,7 @@ export function AppShell({
   activeOrganizationId,
 }: AppShellProps) {
   const pathname = usePathname();
+  const router = useRouter();
   const navGroups = getNavGroupsForRole(appRole);
   const visibleNavGroups =
     appRole === "teacher"
@@ -199,6 +201,33 @@ export function AppShell({
       }
     };
   }, [userEmail]);
+
+  useEffect(() => {
+    if (appRole !== "teacher" || !userEmail || typeof window === "undefined") return;
+    /** Warm common routes during idle time so sidebar navigations snap. */
+    const routes = ["/attendance", "/schedule", "/students", "/onboarding"];
+
+    let idleCallbackId = 0;
+    let fallbackTimeoutId: ReturnType<typeof setTimeout> | undefined;
+
+    const warm = () => {
+      for (const href of routes) router.prefetch(href);
+    };
+
+    const ric = window.requestIdleCallback;
+    if (typeof ric === "function") {
+      idleCallbackId = ric.call(window, () => warm(), { timeout: 4500 });
+    } else {
+      fallbackTimeoutId = setTimeout(warm, 1800);
+    }
+
+    return () => {
+      if (idleCallbackId && typeof window.cancelIdleCallback === "function") {
+        window.cancelIdleCallback(idleCallbackId);
+      }
+      if (fallbackTimeoutId !== undefined) clearTimeout(fallbackTimeoutId);
+    };
+  }, [appRole, router, userEmail]);
 
   return (
     <div className="flex min-h-full flex-1 flex-col">
